@@ -1,5 +1,4 @@
-import os, json, requests
-from datetime import datetime
+import os, requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO
@@ -16,16 +15,12 @@ BASE_URL = os.environ.get("BASE_URL", "https://raidenx8-api.onrender.com")
 stripe.api_key = os.environ.get("STRIPE_API_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
-# PayPal (optional - chưa bật)
-PAYPAL_CLIENT_ID = os.environ.get("PAYPAL_CLIENT_ID")
-PAYPAL_SECRET = os.environ.get("PAYPAL_SECRET")
-
-# ========== App setup ==========
+# ========== App ==========
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 sio = SocketIO(app, cors_allowed_origins="*")
 
-# ========== Demo product data ==========
+# ========== Demo products ==========
 PRODUCTS = [
     {"id": "p1", "name": "Huawei Smartwatch", "price": 19900, "currency": "usd",
      "image": "https://picsum.photos/seed/huawei-watch/400/300"},
@@ -72,14 +67,11 @@ def checkout():
     if not items:
         return jsonify({"ok": False, "error": "No items"}), 400
 
-    line_items = []
-    total = 0
+    line_items, total = [], 0
     for it in items:
-        pid = it.get("id")
-        qty = int(it.get("qty", 1))
+        pid, qty = it.get("id"), int(it.get("qty", 1))
         prod = next((p for p in PRODUCTS if p["id"] == pid), None)
-        if not prod:
-            continue
+        if not prod: continue
         total += prod["price"] * qty
         line_items.append({
             "price_data": {
@@ -105,7 +97,7 @@ def checkout():
         order_id = session.id
         ORDERS[order_id] = {"status": "PENDING", "total": total}
         sio.emit("order_update", {"order_id": order_id, "status": "PENDING"})
-        return jsonify({"ok": True, "checkout_url": session.url})
+        return jsonify({"ok": True, "checkout_url": session.url, "order_id": order_id})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -141,7 +133,6 @@ def webhook():
             tg_send(chat_id, "Xin chào! Đây là RaidenX8 Store 🛍️")
     return jsonify({"ok": True})
 
-# ========== SSE / WebSocket ==========
 @app.route("/events")
 def events():
     return jsonify({"orders": ORDERS})
