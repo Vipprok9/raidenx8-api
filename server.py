@@ -1,74 +1,92 @@
 import os, requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_socketio import SocketIO, emit
 
-# ========= ENV =========
-BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
-TG_API      = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# ===== ENV =====
+BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TG_API     = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-BASE_URL    = os.environ.get("BASE_URL", "https://raidenx8-api.onrender.com")
-
-# (Tuỳ chọn) Stripe test mode
-STRIPE_API_KEY       = os.environ.get("STRIPE_API_KEY", "")
-STRIPE_WEBHOOK_SECRET= os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-
-# ========= App =========
-app = Flask(__name__)
-# Cho phép Cloudflare Pages gọi API (có thể mở rộng thêm domain nếu cần)
-CORS(app, resources={r"/*": {"origins": ["https://raidenx8.pages.dev"]}})
-
-# ========= Demo products (chỉ minh hoạ, không bắt buộc) =========
-PRODUCTS = [
-    {"id": "p1", "name": "Huawei Smartwatch", "price": 19900, "image": "https://picsum.photos/seed/huawei-watch/400/300"},
-    {"id": "p2", "name": "Smartphone X Pro",  "price": 69900, "image": "https://picsum.photos/seed/smartphone/400/300"},
-    {"id": "p3", "name": "Smart Band 7",      "price":  4900, "image": "https://picsum.photos/seed/smartband/400/300"},
-    {"id": "p4", "name": "Laptop UltraBook",  "price":129900, "image": "https://picsum.photos/seed/laptop/400/300"},
-    {"id": "p5", "name": "Áo RaidenX8",       "price":  2500, "image": "https://picsum.photos/seed/ao/400/300"},
-    {"id": "p6", "name": "Sticker Pack",      "price":   500, "image": "https://picsum.photos/seed/sticker/400/300"},
-    {"id": "p7", "name": "Mũ Snapback",       "price":  1500, "image": "https://picsum.photos/seed/mu/400/300"},
+ALLOWED_ORIGINS = [
+    "https://raidenx8.pages.dev",   # frontend Cloudflare Pages của bạn
+    "*"                              # có thể siết lại khi lên prod
 ]
 
-# ========= Utils =========
-def tg_send(chat_id: str, text: str):
-    """Gửi tin nhắn Telegram đơn giản; in lỗi ra log nếu thất bại."""
+# ===== App / Socket =====
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
+socketio = SocketIO(app, cors_allowed_origins=ALLOWED_ORIGINS, async_mode="eventlet")
+
+# ===== Utils =====
+def tg_send(text: str, chat_id: str = None):
+    """Gửi tin nhắn Telegram; trả về dict JSON từ Telegram API."""
+    chat_id = chat_id or TG_CHAT_ID
     if not BOT_TOKEN or not chat_id:
-        print("tg_send skipped: missing token/chat_id")
         return {"ok": False, "error": "missing_token_or_chat_id"}
     try:
-        r = requests.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": text})
+        r = requests.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=15)
         return r.json()
     except Exception as e:
-        print("tg_send err:", e)
         return {"ok": False, "error": str(e)}
 
-# ========= Routes =========
+def log(msg: str, level="info", payload=None):
+    """Phát log về tất cả client qua WS + in server log."""
+    data = {"level": level, "msg": msg, "payload": payload or {}}
+    try:
+        socketio.emit("log", data, broadcast=True)
+    except Exception:
+        pass
+    print(f"[{level}] {msg}", payload or "")
+
+# ===== Routes =====
 @app.route("/health")
 def health():
     return "ok", 200
 
-@app.route("/products")
-def list_products():
-    # trả demo products (tuỳ bạn dùng hay không)
-    return jsonify({"items": PRODUCTS})
-
 @app.route("/send", methods=["POST", "OPTIONS"])
 def send_message():
-    # Cho preflight CORS
+    # Preflight cho CORS
     if request.method == "OPTIONS":
         return ("", 204)
 
     data = request.get_json(silent=True) or {}
-    text = data.get("text") or "Khách bấm Chat với shop từ web RaidenX8"
-    # Cho phép override chat_id khi cần test, mặc định dùng TG_CHAT_ID từ env
+    text = (data.get("text") or "").strip()
     chat_id = str(data.get("chat_id") or TG_CHAT_ID)
 
-    res = tg_send(chat_id, text)
-    status = 200 if res.get("ok") else 500
-    return jsonify(res), status
+    if not text:
+        return jsonify({"ok": False, "error": "empty_text"}), 400
 
-# (Tuỳ chọn) Webhook/Stripe… bạn có thể thêm sau
+    tg_res = tg_send(text, chat_id)
+    ok = bool(tg_res.get("ok"))
+    log("send_from_http", payload={"text": text, "ok": ok, "tg": tg_res})
+    return jsonify(tg_res), (200 if ok else 500)
 
+# ===== Socket.IO events =====
+@socketio.on("connect")
+def on_connect():
+    emit("log", {"level": "info", "msg": "client_connected"})
+    print("[ws] client connected")
+
+@socketio.on("disconnect")
+def on_disconnect():
+    print("[ws] client disconnected")
+
+@socketio.on("chat")
+def on_chat(data):
+    """
+    Client gửi: socket.emit('chat', { text: 'hello', chat_id: optional })
+    Server forward Telegram + broadcast log.
+    """
+    text = (data.get("text") if isinstance(data, dict) else "") or ""
+    chat_id = str(data.get("chat_id") or TG_CHAT_ID) if isinstance(data, dict) else TG_CHAT_ID
+    if not text.strip():
+        emit("log", {"level": "warn", "msg": "empty_text_from_ws"})
+        return
+    tg_res = tg_send(text, chat_id)
+    emit("log", {"level": "info", "msg": "send_from_ws", "payload": {"ok": tg_res.get("ok"), "tg": tg_res}}, broadcast=True)
+
+# ===== Main =====
 if __name__ == "__main__":
-    # Chạy local khi cần test
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    # eventlet được chọn trong Procfile; cổng Render cung cấp qua PORT
+    socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
