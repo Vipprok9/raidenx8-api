@@ -4,5 +4,4 @@ requests
 stripe
 flask-socketio
 eventlet
-web3
 gunicorn
