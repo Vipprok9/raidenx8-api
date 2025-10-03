@@ -1,92 +1,82 @@
-import os, requests
 from flask import Flask, request, jsonify
-from flask_cors import CORS
-from flask_socketio import SocketIO, emit
+import requests
+import os
 
-# ===== ENV =====
-BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-TG_API     = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-ALLOWED_ORIGINS = [
-    "https://raidenx8.pages.dev",   # frontend Cloudflare Pages của bạn
-    "*"                              # có thể siết lại khi lên prod
-]
-
-# ===== App / Socket =====
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
-socketio = SocketIO(app, cors_allowed_origins=ALLOWED_ORIGINS, async_mode="eventlet")
 
-# ===== Utils =====
-def tg_send(text: str, chat_id: str = None):
-    """Gửi tin nhắn Telegram; trả về dict JSON từ Telegram API."""
-    chat_id = chat_id or TG_CHAT_ID
-    if not BOT_TOKEN or not chat_id:
-        return {"ok": False, "error": "missing_token_or_chat_id"}
-    try:
-        r = requests.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=15)
-        return r.json()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+# Env vars
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-def log(msg: str, level="info", payload=None):
-    """Phát log về tất cả client qua WS + in server log."""
-    data = {"level": level, "msg": msg, "payload": payload or {}}
-    try:
-        socketio.emit("log", data, broadcast=True)
-    except Exception:
-        pass
-    print(f"[{level}] {msg}", payload or "")
+# --------- ROUTES ---------
 
-# ===== Routes =====
 @app.route("/health")
 def health():
-    return "ok", 200
+    return jsonify({"status": "ok"})
 
-@app.route("/send", methods=["POST", "OPTIONS"])
+# Send Telegram message
+@app.route("/send", methods=["POST"])
 def send_message():
-    # Preflight cho CORS
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    data = request.get_json(silent=True) or {}
-    text = (data.get("text") or "").strip()
-    chat_id = str(data.get("chat_id") or TG_CHAT_ID)
-
+    data = request.json
+    text = data.get("text", "")
     if not text:
-        return jsonify({"ok": False, "error": "empty_text"}), 400
+        return jsonify({"error": "missing text"}), 400
 
-    tg_res = tg_send(text, chat_id)
-    ok = bool(tg_res.get("ok"))
-    log("send_from_http", payload={"text": text, "ok": ok, "tg": tg_res})
-    return jsonify(tg_res), (200 if ok else 500)
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    res = requests.post(url, json=payload)
+    return jsonify(res.json())
 
-# ===== Socket.IO events =====
-@socketio.on("connect")
-def on_connect():
-    emit("log", {"level": "info", "msg": "client_connected"})
-    print("[ws] client connected")
+# Telegram webhook
+@app.route("/webhook", methods=["POST"])
+def telegram_webhook():
+    update = request.json
+    if not update:
+        return jsonify({"error": "no update"}), 400
 
-@socketio.on("disconnect")
-def on_disconnect():
-    print("[ws] client disconnected")
+    if "message" in update:
+        chat_id = update["message"]["chat"]["id"]
+        text = update["message"].get("text", "")
+        reply = f"You said: {text}"
 
-@socketio.on("chat")
-def on_chat(data):
-    """
-    Client gửi: socket.emit('chat', { text: 'hello', chat_id: optional })
-    Server forward Telegram + broadcast log.
-    """
-    text = (data.get("text") if isinstance(data, dict) else "") or ""
-    chat_id = str(data.get("chat_id") or TG_CHAT_ID) if isinstance(data, dict) else TG_CHAT_ID
-    if not text.strip():
-        emit("log", {"level": "warn", "msg": "empty_text_from_ws"})
-        return
-    tg_res = tg_send(text, chat_id)
-    emit("log", {"level": "info", "msg": "send_from_ws", "payload": {"ok": tg_res.get("ok"), "tg": tg_res}}, broadcast=True)
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": chat_id, "text": reply})
 
-# ===== Main =====
+    return jsonify({"ok": True})
+
+# AI Chat Proxy
+@app.route("/api/chat", methods=["POST"])
+def chat_proxy():
+    data = request.json
+    text = data.get("text", "")
+    provider = data.get("provider", "openai")  # "openai" hoặc "gemini"
+
+    if provider == "openai":
+        if not OPENAI_API_KEY:
+            return jsonify({"error": "OPENAI_API_KEY not set"}), 400
+        # gọi OpenAI API
+        import openai
+        openai.api_key = OPENAI_API_KEY
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": text}]
+        )
+        reply = response["choices"][0]["message"]["content"]
+
+    elif provider == "gemini":
+        if not GEMINI_API_KEY:
+            return jsonify({"error": "GEMINI_API_KEY not set"}), 400
+        # demo giả sử (thực tế gọi API Google AI Studio)
+        reply = f"[Gemini demo] Bạn hỏi: {text}"
+
+    else:
+        reply = "Unknown provider"
+
+    return jsonify({"reply": reply})
+
+
 if __name__ == "__main__":
-    # eventlet được chọn trong Procfile; cổng Render cung cấp qua PORT
-    socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
