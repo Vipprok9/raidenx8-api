@@ -1,1 +1,1 @@
-web: gunicorn -k eventlet -w 1 server:app
+gunicorn server:app --preload --bind 0.0.0.0:$PORT
