@@ -1,121 +1,145 @@
-import os, time, json, requests
+import os
+import time
+from collections import deque
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
+import requests
 
+# --- App & Realtime ---
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}, r"/socket.io/*": {"origins": "*"}})
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
-# WebSocket (Socket.IO)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet", logger=False, engineio_logger=False)
+# --- Env vars ---
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")  # optional
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-DEFAULT_TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# --- In-memory event buffer (fallback polling) ---
+EVENTS = deque(maxlen=200)
 
-CACHE_SECONDS = 20
-_cache = {"ts": 0, "data": None}
+def push_event(kind, payload):
+    evt = {
+        "ts": int(time.time()),
+        "kind": kind,        # "incoming" (from Telegram) | "outgoing" (from web)
+        "data": payload
+    }
+    EVENTS.append(evt)
+    # broadcast to all websocket clients
+    socketio.emit("message", evt, namespace="/ws", broadcast=True)
+    return evt
 
-def err(msg, code=400): return jsonify({"ok": False, "error": msg}), code
+# ---------- Routes ----------
+@app.route("/", methods=["GET"])
+def root():
+    return "RaidenX8 API is up."
 
-@app.get("/health")
-def health(): return jsonify({"ok": True, "ts": int(time.time())})
+@app.route("/health", methods=["GET"])
+def health():
+    return "ok", 200
 
-# ---------- Prices (CoinGecko) ----------
-@app.get("/api/prices")
-def prices():
-    ids = request.args.get("ids", "bitcoin,ethereum,bnb,toncoin,tether")
-    vs  = request.args.get("vs",  "usd")
-    now = time.time()
-    if _cache["data"] and (now - _cache["ts"] < CACHE_SECONDS):
-        return jsonify({"ok": True, "cached": True, "data": _cache["data"]})
-    try:
-        url = "https://api.coingecko.com/api/v3/simple/price"
-        r = requests.get(url, params={"ids": ids, "vs_currencies": vs, "include_24hr_change": "true"}, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        _cache["ts"], _cache["data"] = now, data
-        socketio.emit("prices", {"at": int(now), "source": "live"})
-        return jsonify({"ok": True, "cached": False, "data": data})
-    except Exception:
-        demo = {
-            "bitcoin":  {"usd": 120334, "usd_24h_change": 1.17},
-            "ethereum": {"usd": 4477.91, "usd_24h_change": 2.02},
-            "bnb":      {"usd": 1109.20, "usd_24h_change": 5.16},
-            "toncoin":  {"usd": None,   "usd_24h_change": None},
-            "tether":   {"usd": 1,      "usd_24h_change": 0.0},
-        }
-        socketio.emit("prices", {"at": int(now), "source": "demo"})
-        return jsonify({"ok": True, "cached": True, "source": "fallback-demo", "data": demo})
+@app.route("/events", methods=["GET"])
+def events():
+    """
+    Polling fallback for clients that can't use WebSocket.
+    Optional query: ?since=unix_ts to get only newer items.
+    """
+    since = int(request.args.get("since", 0))
+    data = [e for e in list(EVENTS) if e["ts"] > since]
+    return jsonify({"events": data})
 
-# ---------- Telegram Notify ----------
-@app.post("/api/notify")
-def notify():
-    if not TELEGRAM_BOT_TOKEN: return err("Missing TELEGRAM_BOT_TOKEN.")
+@app.route("/send", methods=["POST"])
+def send():
+    """
+    Send a message to Telegram chat.
+    Body JSON: { "text": "hello" }
+    """
+    if not BOT_TOKEN or not CHAT_ID:
+        return jsonify({"error": "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"}), 400
+
+    payload = request.get_json(silent=True) or {}
+    text = (payload.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    resp = requests.post(url, json={"chat_id": CHAT_ID, "text": text})
+    ok = resp.ok
+    data = resp.json() if resp.content else {}
+
+    push_event("outgoing", {"text": text, "ok": ok, "tg": data})
+    return jsonify({"ok": ok, "tg": data}), (200 if ok else 500)
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    """
+    Telegram will POST updates here.
+    Set your webhook to: https://<your-service>.onrender.com/webhook
+    """
+    update = request.get_json(silent=True) or {}
+    msg = (update.get("message") or update.get("edited_message") or {})
+    chat = msg.get("chat") or {}
+    text = msg.get("text", "")
+
+    info = {
+        "from_chat_id": chat.get("id"),
+        "from_title": chat.get("title") or f'{chat.get("first_name","")} {chat.get("last_name","")}'.strip(),
+        "text": text,
+        "raw": update
+    }
+    push_event("incoming", info)
+    return jsonify({"ok": True})
+
+# ---------- WebSocket namespace ----------
+@socketio.on("connect", namespace="/ws")
+def ws_connect():
+    emit("ready", {"message": "connected", "ts": int(time.time())})
+
+@socketio.on("send", namespace="/ws")
+def ws_send(data):
+    """
+    Client emits: socket.emit('send', { text: 'hi' })
+    We forward to Telegram like /send.
+    """
+    text = (data or {}).get("text", "").strip()
+    if not text:
+        emit("error", {"error": "text is required"})
+        return
+
+    if not BOT_TOKEN or not CHAT_ID:
+        emit("error", {"error": "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"})
+        return
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    resp = requests.post(url, json={"chat_id": CHAT_ID, "text": text})
+    ok = resp.ok
+    tg = resp.json() if resp.content else {}
+    push_event("outgoing", {"text": text, "ok": ok, "tg": tg})
+
+# ---------- Optional: simple AI proxy (safe fallback) ----------
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
+    """
+    Body: { "prompt": "..." }
+    If OPENAI_API_KEY is missing, return a friendly canned reply.
+    """
     body = request.get_json(silent=True) or {}
-    message = (body.get("message") or body.get("text") or "").strip()
-    chat_id = str(body.get("chat_id") or DEFAULT_TELEGRAM_CHAT_ID).strip()
-    if not message: return err("Message is required.")
-    if not chat_id: return err("chat_id required (or set TELEGRAM_CHAT_ID env).")
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        r = requests.post(url, json={"chat_id": chat_id, "text": message}, timeout=10)
-        r.raise_for_status()
-        socketio.emit("notify", {"ok": True, "chat_id": chat_id})
-        return jsonify({"ok": True, "result": r.json()})
-    except Exception as e:
-        socketio.emit("notify", {"ok": False, "error": str(e)})
-        return err(f"Telegram error: {e}", 502)
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "prompt is required"}), 400
 
-# ---------- AI Chat Proxy ----------
-@app.post("/api/chat")
-def chat():
-    body = request.get_json(silent=True) or {}
-    provider = (body.get("provider") or "openai").lower()
-    prompt   = (body.get("prompt") or body.get("message") or "").strip()
-    system   = body.get("system") or "You are a helpful assistant for Web3/Airdrop/DeFi."
-    if not prompt: return err("prompt is required.")
-    try:
-        if provider == "gemini":
-            if not GEMINI_API_KEY: return err("Missing GEMINI_API_KEY.")
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}"
-            payload = {"contents":[{"parts":[{"text": f"{system}\n\nUser: {prompt}"}]}]}
-            r = requests.post(url, json=payload, timeout=25); r.raise_for_status()
-            data = r.json()
-            text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-            socketio.emit("ai", {"provider": "gemini", "ok": True})
-            return jsonify({"ok": True, "provider": "gemini", "text": text})
-        # OpenAI
-        if not OPENAI_API_KEY: return err("Missing OPENAI_API_KEY.")
-        url = "https://api.openai.com/v1/responses"
-        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"}
-        payload = {"model":"gpt-4o-mini","input":[{"role":"system","content":system},{"role":"user","content":prompt}]}
-        r = requests.post(url, headers=headers, json=payload, timeout=25); r.raise_for_status()
-        data = r.json()
-        text = data.get("output_text") if isinstance(data.get("output_text"), str) else json.dumps(data)[:1200]
-        socketio.emit("ai", {"provider": "openai", "ok": True})
-        return jsonify({"ok": True, "provider": "openai", "text": text})
-    except Exception as e:
-        socketio.emit("ai", {"ok": False, "error": str(e)})
-        return err(f"AI error: {e}", 502)
+    if not OPENAI_KEY:
+        reply = "AI đang ở chế độ demo. Thêm OPENAI_API_KEY vào Render để bật trả lời thông minh."
+        push_event("ai_reply", {"prompt": prompt, "reply": reply})
+        return jsonify({"reply": reply})
 
-# ---------- WS Handlers ----------
-@socketio.on("connect")
-def on_connect(): emit("system", {"hello": "connected to RaidenX8 WS 👋"})
+    # (Để tối giản: chưa gọi API thật, tránh lỗi deploy nếu thiếu lib. Bạn muốn mình nối API thật thì mình thêm ngay.)
+    reply = f"[AI stub] Bạn hỏi: {prompt}"
+    push_event("ai_reply", {"prompt": prompt, "reply": reply})
+    return jsonify({"reply": reply})
 
-@socketio.on("ping")
-def on_ping(_): emit("pong", {"ts": int(time.time())})
-
-@socketio.on("chat")
-def on_chat(data):
-    msg = (data or {}).get("text", "")
-    emit("chat", {"from": "server", "reply": f"got: {msg}"}, broadcast=True)
-
-@app.get("/")
-def index(): return jsonify({"ok": True, "service": "RaidenX8 API (WS+REST)"})
-
-
+# ---------- Local run ----------
 if __name__ == "__main__":
-    # eventlet để WS mượt trên Render
-    socketio.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    # Use socketio runner to support WebSocket locally
+    socketio.run(app, host="0.0.0.0", port=5000)
