@@ -1,7 +1,5 @@
 flask
 flask-cors
 requests
-stripe
-flask-socketio
-eventlet
 gunicorn
+openai
