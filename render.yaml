@@ -4,7 +4,6 @@ services:
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
-    
     autoDeploy: true
     envVars:
       - key: PYTHONUNBUFFERED
