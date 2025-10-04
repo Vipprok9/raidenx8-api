@@ -1,6 +1,5 @@
-flask
-flask-cors
-requests
-gunicorn
-flask-socketio
-eventlet
+Flask==3.0.3
+Flask-Cors==4.0.0
+Flask-SocketIO==5.3.6
+python-socketio==5.11.3
+requests==2.32.3
