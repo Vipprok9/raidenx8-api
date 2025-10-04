@@ -1,153 +1,99 @@
 import os
 import time
-import json
 from collections import deque
-
-import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
+import requests
 
-# ========= App & realtime =========
+# ========== App ==========
 app = Flask(__name__)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
-# ========= ENV =========
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
+# ========== Env ==========
+BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")     # dùng nếu có OpenAI
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")     # dùng nếu có Gemini
 
-# ========= Event buffer for UI log =========
 EVENTS = deque(maxlen=200)
 
-def push_event(kind: str, data):
-    evt = {"ts": int(time.time()), "kind": kind, "data": data}
+def push_event(kind, payload):
+    evt = {"ts": int(time.time()), "kind": kind, "data": payload}
     EVENTS.append(evt)
-    # broadcast to WS clients
     socketio.emit("message", evt, namespace="/ws")
     return evt
 
-# ========= Routes =========
-@app.route("/", methods=["GET"])
+# ========== Routes ==========
+@app.route("/")
 def root():
     return "RaidenX8 API is up."
 
-@app.route("/health", methods=["GET"])
+@app.route("/health")
 def health():
     return "ok", 200
 
-@app.route("/events", methods=["GET"])
+@app.route("/events")
 def events():
-    """Polling fallback for the front-end."""
-    try:
-        since = int(request.args.get("since", "0"))
-    except ValueError:
-        since = 0
-    data = [e for e in list(EVENTS) if e["ts"] >= since]
-    # chỉ trả JSON đơn giản -> tránh recursion
-    return jsonify({"events": data})
+    return jsonify({"events": list(EVENTS)})
 
 @app.route("/send", methods=["POST"])
 def send():
-    """
-    Front-end gọi để gửi msg lên Telegram.
-    Body JSON: { "text": "hello" }
-    """
     if not BOT_TOKEN or not CHAT_ID:
-        push_event("error", {"where": "/send", "msg": "Missing TELEGRAM_* env"})
-        return jsonify({"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"}), 500
-
-    payload = request.get_json(silent=True) or {}
-    text = (payload.get("text") or "").strip()
-    if not text:
-        return jsonify({"ok": False, "error": "text is empty"}), 400
-
+        return {"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN/CHAT_ID"}, 400
+    text = (request.json or {}).get("text", "")
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    try:
-        resp = requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=15)
-        ok = resp.ok
-        # parse JSON an toàn
-        try:
-            tg = resp.json()
-        except Exception:
-            tg = {"raw": resp.text}
-        push_event("outgoing", {"text": text, "ok": ok})
-        return jsonify({"ok": ok, "tg": tg})
-    except Exception as e:
-        push_event("error", {"where": "/send", "msg": str(e)})
-        return jsonify({"ok": False, "error": str(e)}), 500
+    resp = requests.post(url, json={"chat_id": CHAT_ID, "text": text})
+    push_event("outgoing", {"text": text, "tg": resp.json()})
+    return resp.json()
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """
-    Telegram sẽ POST update vào đây.
-    Nhớ set webhook: https://api.telegram.org/bot<token>/setWebhook?url=https://<render-app>/webhook
-    """
-    update = request.get_json(silent=True) or {}
-    # rút gọn thông tin để log
-    msg = (update.get("message") or update.get("edited_message") or {})
-    chat = msg.get("chat") or {}
+    update = request.json or {}
+    msg = update.get("message", {})
     text = msg.get("text", "")
+    push_event("incoming", {"text": text, "raw": update})
+    return {"ok": True}
 
-    info = {
-        "from_chat_id": chat.get("id"),
-        "from_title": chat.get("title") or chat.get("username") or chat.get("first_name"),
-        "text": text,
-        "raw": {"update_id": update.get("update_id")}
-    }
-    push_event("incoming", info)
-    return jsonify({"ok": True})
+# ========== AI Chat ==========
+@app.route("/ask", methods=["POST"])
+def ask_ai():
+    payload = request.json or {}
+    query = payload.get("text", "").strip()
+    if not query:
+        return {"ok": False, "error": "No text"}, 400
 
-# ========= WebSocket =========
+    # Ưu tiên Gemini nếu có
+    if GEMINI_KEY:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={GEMINI_KEY}"
+        resp = requests.post(url, json={"contents":[{"parts":[{"text":query}]}]})
+        data = resp.json()
+        answer = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+        push_event("ai_reply", {"q": query, "a": answer})
+        return {"ok": True, "answer": answer, "raw": data}
+
+    # Nếu không có Gemini thì fallback qua OpenAI
+    if OPENAI_KEY:
+        headers = {"Authorization": f"Bearer {OPENAI_KEY}"}
+        resp = requests.post("https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json={
+                "model": "gpt-4o-mini",
+                "messages":[{"role":"user","content":query}]
+            })
+        data = resp.json()
+        answer = data["choices"][0]["message"]["content"]
+        push_event("ai_reply", {"q": query, "a": answer})
+        return {"ok": True, "answer": answer, "raw": data}
+
+    return {"ok": False, "error": "No AI key provided"}, 400
+
+# ========== WS ==========
 @socketio.on("connect", namespace="/ws")
 def ws_connect():
     emit("ready", {"message": "connected", "ts": int(time.time())})
 
-@socketio.on("send", namespace="/ws")
-def ws_send(data):
-    """
-    Front-end có thể emit 'send' qua WS: { "text": "..." }
-    Mình forward giống như /send nhưng KHÔNG gọi chính ws_send nữa -> tránh recursion.
-    """
-    text = (data or {}).get("text", "").strip()
-    if not text:
-        emit("error", {"error": "text is empty"})
-        return
-
-    if not BOT_TOKEN or not CHAT_ID:
-        emit("error", {"error": "Missing TELEGRAM_* env"})
-        return
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    try:
-        resp = requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=15)
-        ok = resp.ok
-        try:
-            tg = resp.json()
-        except Exception:
-            tg = {"raw": resp.text}
-        push_event("outgoing", {"text": text, "ok": ok})
-        emit("sent", {"ok": ok, "tg": tg})
-    except Exception as e:
-        push_event("error", {"where": "ws_send", "msg": str(e)})
-        emit("error", {"error": str(e)})
-
-# ========= Optional: simple AI echo for demo =========
-@app.route("/api/chat", methods=["POST"])
-def api_chat():
-    body = request.get_json(silent=True) or {}
-    prompt = (body.get("prompt") or "").strip()
-    if not prompt:
-        return jsonify({"error": "prompt is empty"}), 400
-
-    # Chưa nối OpenAI thì trả lời stub
-    reply = f"[AI stub] Bạn hỏi: {prompt}"
-    push_event("ai_reply", {"prompt": prompt, "reply": reply})
-    return jsonify({"reply": reply})
-
-# ========= Entrypoint =========
+# ========== Run ==========
 if __name__ == "__main__":
-    # Render cung cấp PORT env
-    port = int(os.getenv("PORT", "8000"))
-    socketio.run(app, host="0.0.0.0", port=port)
+    socketio.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
