@@ -1,156 +1,126 @@
 import os
 import time
 import logging
-from typing import Any, Dict
-
-import requests
-from flask import Flask, jsonify, request
+from typing import Dict, Any
+from flask import Flask, request, jsonify
 from flask_cors import CORS
+import requests
 
-# ---------- App & CORS ----------
+# ----------------------------
+# Config
+# ----------------------------
+SERVICE_NAME = "raidenx8-api"
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")  # optional
+
+# CORS: chỉ cho phép Pages.dev của bạn + localhost để dev
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS",
+    "https://raidenx8.pages.dev,http://localhost:8788,http://localhost:5173"
+).split(",")
+
 app = Flask(__name__)
-# Cho phép mọi origin (đơn giản nhất). Nếu muốn chỉ cho pages.dev:
-# CORS(app, resources={r"/api/*": {"origins": "https://raidenx8.pages.dev"}})
-CORS(app)
+CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
 
-# ---------- Config qua ENV ----------
-SERVICE_NAME = os.getenv("SERVICE_NAME", "raidenx8-api")
-
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
-
-# Optional: Gemini
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-
-# ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("raidenx8-api")
+log = logging.getLogger("raidenx8")
 
+# ----------------------------
+# Helpers
+# ----------------------------
+def ok(data: Dict[str, Any] = None, status: int = 200):
+    payload = {"ok": True, "service": SERVICE_NAME, "time": int(time.time())}
+    if data:
+        payload.update(data)
+    return jsonify(payload), status
 
-# ---------- Helpers ----------
-def _json_ok(**extra: Dict[str, Any]):
-    base = {"ok": True, "service": SERVICE_NAME, "time": int(time.time())}
-    base.update(extra)
-    return jsonify(base)
+def fail(message: str, status: int = 400, extra: Dict[str, Any] = None):
+    payload = {"ok": False, "service": SERVICE_NAME, "time": int(time.time()), "error": message}
+    if extra:
+        payload.update(extra)
+    return jsonify(payload), status
 
-
-def _json_error(message: str, http_code: int = 400, **extra: Dict[str, Any]):
-    base = {"ok": False, "service": SERVICE_NAME, "time": int(time.time()), "error": message}
-    base.update(extra)
-    return jsonify(base), http_code
-
-
-# ---------- Routes ----------
-@app.get("/")
-def root():
-    return _json_ok(msg="alive")
-
-
+# ----------------------------
+# Routes
+# ----------------------------
 @app.get("/health")
 def health():
-    return _json_ok()
+    return ok()
 
-
-@app.post("/api/notify")
-def api_notify():
+@app.post("/notify-telegram")
+def notify_telegram():
     """
-    Body JSON:
-      { "text": "nội dung" }
-    Env cần có: TG_BOT_TOKEN, TG_CHAT_ID
+    Body JSON: { "text": "Hello from RaidenX8!" }
     """
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        return _json_error("Missing TG_BOT_TOKEN or TG_CHAT_ID in environment.", 500)
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return fail("Telegram env not set (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID).", 500)
 
-    data = request.get_json(silent=True) or {}
-    text = (data.get("text") or data.get("message") or "").strip()
-    if not text:
-        return _json_error("Missing 'text' in JSON body.", 422)
-
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
     try:
-        resp = requests.post(url, json=payload, timeout=10)
-        ok = resp.ok
-        body = {}
-        try:
-            body = resp.json()
-        except Exception:
-            body = {"raw": resp.text}
-
-        if not ok:
-            logger.error("Telegram error %s: %s", resp.status_code, body)
-            return _json_error("Telegram sendMessage failed.", 502, telegram=body)
-
-        return _json_ok(sent=True, telegram=body)
-    except requests.Timeout:
-        return _json_error("Telegram request timeout.", 504)
-    except Exception as e:
-        logger.exception("Notify error")
-        return _json_error(f"Notify exception: {e}", 500)
-
-
-@app.post("/api/chat")
-def api_chat():
-    """
-    Body JSON:
-      { "prompt": "câu hỏi" }
-
-    - Nếu có GEMINI_API_KEY: gọi Gemini REST (v1beta).
-    - Nếu không có: trả lời echo để test UI.
-    """
-    data = request.get_json(silent=True) or {}
-    prompt = (data.get("prompt") or data.get("message") or "").strip()
-    if not prompt:
-        return _json_error("Missing 'prompt' in JSON body.", 422)
-
-    # Không có key -> echo để an toàn deploy
-    if not GEMINI_API_KEY:
-        return _json_ok(reply=f"Bạn vừa nói: {prompt}", model="echo")
-
-    # Gọi Gemini qua REST (không cần cài thêm thư viện)
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    )
-    body = {
-        "contents": [
-            {
-                "parts": [{"text": prompt}]
-            }
-        ]
-    }
-    try:
-        resp = requests.post(url, json=body, timeout=15)
-        jr = resp.json()
-        if not resp.ok:
-            logger.error("Gemini error %s: %s", resp.status_code, jr)
-            return _json_error("Gemini API error.", 502, gemini=jr)
-
-        # Lấy text từ candidates
-        text = ""
-        try:
-            text = jr["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception:
-            text = ""
-
+        data = request.get_json(force=True, silent=True) or {}
+        text = str(data.get("text", "")).strip()
         if not text:
-            text = "(Không nhận được nội dung trả về từ Gemini.)"
+            return fail("Missing 'text'.", 422)
 
-        return _json_ok(reply=text, model=GEMINI_MODEL)
-    except requests.Timeout:
-        return _json_error("Gemini request timeout.", 504)
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
+        if resp.status_code != 200:
+            log.error("Telegram response: %s - %s", resp.status_code, resp.text)
+            return fail("Telegram API error.", 502, {"telegram_status": resp.status_code})
+
+        return ok({"sent": True})
     except Exception as e:
-        logger.exception("Gemini exception")
-        return _json_error(f"Gemini exception: {e}", 500)
+        log.exception("notify-telegram error")
+        return fail(f"Exception: {e}", 500)
 
+@app.post("/ask")
+def ask():
+    """
+    Body JSON: { "question": "..." }
+    - Nếu có GEMINI_API_KEY: gọi Gemini 1.5-pro (REST simple).
+    - Nếu không có API: trả lời mock để UI vẫn chạy.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    question = str(data.get("question", "")).strip()
+    if not question:
+        return fail("Missing 'question'.", 422)
 
-# ---------- Main (local run) ----------
+    if not GEMINI_API_KEY:
+        # Không có API key vẫn trả về cho UI hiển thị được
+        reply = f"[Mock AI] Bạn hỏi: “{question}”. Hãy cấu hình GEMINI_API_KEY để nhận câu trả lời thật."
+        return ok({"answer": reply, "provider": "mock"})
+
+    try:
+        # Gọi Gemini (REST)
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": [{"parts": [{"text": question}]}]
+        }
+        params = {"key": GEMINI_API_KEY}
+
+        r = requests.post(url, headers=headers, json=payload, params=params, timeout=30)
+        if r.status_code != 200:
+            log.error("Gemini error %s: %s", r.status_code, r.text)
+            return fail("Gemini API error.", 502, {"gemini_status": r.status_code})
+
+        data = r.json()
+        # Lấy text đầu tiên
+        answer = (
+            data.get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("text", "")
+        ) or "(Empty)"
+        return ok({"answer": answer, "provider": "gemini"})
+    except Exception as e:
+        log.exception("ask error")
+        return fail(f"Exception: {e}", 500)
+
+# ----------------------------
+# Main
+# ----------------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    # Dev run (trên Render sẽ dùng gunicorn)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
