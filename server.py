@@ -1,109 +1,166 @@
-# server.py — RaidenX8_Final_Plus (Backend Render)
+import os, time, threading, requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from flask_socketio import SocketIO
-import os, requests, threading, time, random
+from flask_socketio import SocketIO, emit
 
-# ==== CẤU HÌNH CƠ BẢN ====
+APP_NAME = "raidenx8-api"
+
+# ====== Flask & Socket.IO ======
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
-socketio = SocketIO(app, cors_allowed_origins="*")
 
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode="threading",     # tránh eventlet/gevent
+    ping_interval=25,
+    ping_timeout=60,
+)
+
+# ====== ENV ======
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-COINGECKO_IDS = os.getenv("COINGECKO_IDS", "bitcoin,ethereum,tether,binancecoin,solana,toncoin").split(",")
+DEFAULT_CHAT_ID    = os.getenv("DEFAULT_CHAT_ID", "6142290415")
+
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
+
+COINGECKO_IDS = os.getenv(
+    "COINGECKO_IDS",
+    "bitcoin,ethereum,tether,binancecoin,solana,toncoin"
+)
 CG_INTERVAL = int(os.getenv("CG_INTERVAL_SECONDS", "30"))
 
-prices_cache = []
+# ====== STATE ======
+prices_cache = {}     # {symbol: {price, change_24h}}
+last_fetch_ts = 0
 
-# ==== FETCH GIÁ COINGECKO ====
-def fetch_prices_loop():
-    global prices_cache
+# ====== HELPERS ======
+def fetch_coingecko(ids: str):
+    url = (
+        "https://api.coingecko.com/api/v3/coins/markets"
+        f"?vs_currency=usd&ids={ids}&price_change_percentage=24h"
+    )
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    out = {}
+    for it in r.json():
+        sym = it.get("symbol","").upper()
+        out[sym] = {
+            "name": it.get("name"),
+            "price": it.get("current_price"),
+            "change_24h": it.get("price_change_percentage_24h_in_currency"),
+        }
+    return out
+
+def broadcast_prices(src="poll"):
+    socketio.emit("prices", {"prices": prices_cache, "source": src})
+
+def coingecko_loop():
+    global prices_cache, last_fetch_ts
     while True:
         try:
-            ids = ",".join(COINGECKO_IDS)
-            url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd&include_24hr_change=true"
-            res = requests.get(url, timeout=10)
-            data = res.json()
-            prices_cache = []
-            for k, v in data.items():
-                prices_cache.append({
-                    "symbol": k.upper(),
-                    "price": v["usd"],
-                    "change24h": v.get("usd_24h_change", 0)
-                })
-            socketio.emit("prices", {"prices": prices_cache, "source": "coingecko"})
+            data = fetch_coingecko(COINGECKO_IDS)
+            prices_cache = data
+            last_fetch_ts = int(time.time())
+            broadcast_prices("coingecko")
         except Exception as e:
-            print("Fetch error:", e)
+            print("[coingecko] error:", e)
         time.sleep(CG_INTERVAL)
 
-threading.Thread(target=fetch_prices_loop, daemon=True).start()
+# ====== ROUTES ======
+@app.route("/")
+def root():
+    return jsonify({"ok": True, "service": APP_NAME})
 
-# ==== ROUTES ====
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "prices": len(prices_cache)})
+    return jsonify({
+        "status": "ok",
+        "service": APP_NAME,
+        "prices": len(prices_cache),
+        "last_fetch_ts": last_fetch_ts
+    })
 
 @app.route("/prices")
 def get_prices():
-    return jsonify({"prices": prices_cache, "source": "coingecko"})
+    return jsonify({"prices": prices_cache, "ts": last_fetch_ts})
 
 @app.route("/notify", methods=["POST"])
 def notify():
-    data = request.get_json(force=True)
-    msg = data.get("text", "")
-    chat_id = data.get("chat_id", "")
-    if not TELEGRAM_BOT_TOKEN or not chat_id or not msg:
-        return jsonify({"error": "missing fields"}), 400
+    if not TELEGRAM_BOT_TOKEN:
+        return jsonify({"ok": False, "error": "TELEGRAM_BOT_TOKEN missing"}), 400
+    data = request.get_json(force=True, silent=True) or {}
+    chat_id = str(data.get("chat_id") or DEFAULT_CHAT_ID)
+    text    = data.get("text") or "Hi from RaidenX8"
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    res = requests.post(url, json={"chat_id": chat_id, "text": msg})
-    return jsonify(res.json())
+    res = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=30)
+    return jsonify(res.json()), (200 if res.ok else 500)
 
+@app.route("/notify/test")
+def notify_test():
+    if not TELEGRAM_BOT_TOKEN:
+        return jsonify({"ok": False, "error": "TELEGRAM_BOT_TOKEN missing"}), 400
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    res = requests.post(url, json={"chat_id": DEFAULT_CHAT_ID, "text": "RaidenX8 test ✅"}, timeout=30)
+    return jsonify(res.json()), (200 if res.ok else 500)
+
+# ====== AI (mở tuỳ env) ======
 @app.route("/ai", methods=["POST"])
-def ai_reply():
-    data = request.get_json(force=True)
-    prompt = data.get("message", "")
-    provider = data.get("provider", "openai").lower()
-    if not prompt:
-        return jsonify({"error": "no message"}), 400
+def ai_chat():
+    data = request.get_json(force=True, silent=True) or {}
+    provider = (data.get("provider") or "openai").lower()
+    prompt   = data.get("prompt") or ""
+    if not prompt.strip():
+        return jsonify({"ok": False, "error": "empty prompt"}), 400
 
     try:
-        if provider == "gemini" and GEMINI_API_KEY:
-            resp = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={GEMINI_API_KEY}",
-                json={"contents": [{"parts": [{"text": prompt}]}]},
-                timeout=15
-            ).json()
-            text = resp["candidates"][0]["content"]["parts"][0]["text"]
-            return jsonify({"reply": text, "provider": "gemini"})
-
-        elif provider == "openai" and OPENAI_API_KEY:
+        if provider == "openai":
+            if not OPENAI_API_KEY:
+                return jsonify({"ok": False, "error": "OPENAI_API_KEY missing"}), 400
+            # Minimal OpenAI Responses API (兼容 gpt-4o-mini / o4-mini nếu bật)
+            url = "https://api.openai.com/v1/chat/completions"
             headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-            resp = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json={
-                    "model": "gpt-3.5-turbo",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.7,
-                },
-                timeout=15
-            ).json()
-            text = resp["choices"][0]["message"]["content"]
-            return jsonify({"reply": text, "provider": "openai"})
+            payload = {
+                "model": "gpt-4o-mini",
+                "messages": [{"role":"user", "content": prompt}],
+                "temperature": 0.7
+            }
+            r = requests.post(url, json=payload, headers=headers, timeout=60)
+            r.raise_for_status()
+            msg = r.json()["choices"][0]["message"]["content"]
+            return jsonify({"ok": True, "provider": "openai", "text": msg})
+
+        elif provider == "gemini":
+            if not GEMINI_API_KEY:
+                return jsonify({"ok": False, "error": "GEMINI_API_KEY missing"}), 400
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+            payload = {"contents":[{"parts":[{"text": prompt}]}]}
+            r = requests.post(url, json=payload, timeout=60)
+            r.raise_for_status()
+            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            return jsonify({"ok": True, "provider": "gemini", "text": text})
+
         else:
-            # Fallback mini-AI rule
-            basic = ["Xin chào!", "Mình là AI của RaidenX8 ⚡", "Trend hôm nay là Web3 & AI!", "Giá đang biến động mạnh nha!"]
-            return jsonify({"reply": random.choice(basic), "provider": "local"})
+            return jsonify({"ok": False, "error": "unsupported provider"}), 400
+
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-# ==== SOCKET.IO ====
+# ====== SOCKET.IO ======
 @socketio.on("connect")
-def handle_connect():
-    socketio.emit("prices", {"prices": prices_cache, "source": "init"})
+def on_connect():
+    emit("server", {"ok": True, "msg": "socket connected"})
+    emit("prices", {"prices": prices_cache, "source": "init"})
 
+@socketio.on("pingme")
+def on_ping(_=None):
+    emit("pongme", {"ts": int(time.time())})
+
+def _start_bg():
+    t = threading.Thread(target=coingecko_loop, daemon=True)
+    t.start()
+
+# ====== ENTRY ======
 if __name__ == "__main__":
-    socketio.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    _start_bg()
+    socketio.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
