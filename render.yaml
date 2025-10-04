@@ -4,7 +4,7 @@ services:
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn -k gthread -w 1 --threads 16 -b 0.0.0.0:$PORT server:app"
+    
     autoDeploy: true
     envVars:
       - key: PYTHONUNBUFFERED
