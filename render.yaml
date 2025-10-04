@@ -1,15 +1,17 @@
 services:
-- type: web
-  name: raidenx8-api
-  env: python
-  plan: free
-  buildCommand: pip install -r requirements.txt
-  startCommand: python server.py
-  autoDeploy: false
-  envVars:
-  - key: TELEGRAM_BOT_TOKEN
-    sync: false
-  - key: OPENAI_API_KEY
-    sync: false
-  - key: GEMINI_API_KEY
-    sync: false
+  - type: web
+    name: raidenx8-api
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn -k eventlet -w 1 server:app"
+    autoDeploy: true
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "1"

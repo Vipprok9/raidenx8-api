@@ -1,1 +1,1 @@
-web: gunicorn server:app --workers 1 --threads 4 --bind 0.0.0.0:$PORT --timeout 120
+web: gunicorn -k eventlet -w 1 server:app
