@@ -1,1 +1,1 @@
-gunicorn server:app -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 -b 0.0.0.0:$PORT --timeout 120
+python-3.12.6
