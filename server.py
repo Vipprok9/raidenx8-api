@@ -1,101 +1,113 @@
-import os, requests
+import os, time, requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_socketio import SocketIO, emit
 
+# ---------- App ----------
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
+socketio = SocketIO(app, cors_allowed_origins="*")
 
-# ====== ENV ======
-BOT_TOKEN       = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "").strip()
-GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY","")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY","")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","")
 
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage" if BOT_TOKEN else None
-
-@app.get("/")
+# ---------- Health ----------
+@app.route("/", methods=["GET"])
 def health():
-    return jsonify(ok=True, service="raidenx8-api")
+    return jsonify({"ok": True, "name": "raidenx8-api", "socket": True})
 
-# ====== Telegram notify ======
-@app.post("/notify")
+# ---------- Telegram Notify ----------
+@app.route("/notify", methods=["POST"])
 def notify():
     data = request.get_json(silent=True) or {}
-    chat_id = str(data.get("chat_id", "")).strip()
-    text    = str(data.get("text", "")).strip()[:4000]
-
-    if not BOT_TOKEN:
-        return jsonify(ok=False, error="Missing TELEGRAM_BOT_TOKEN"), 500
+    chat_id = str(data.get("chat_id","")).strip()
+    text = str(data.get("text","")).strip()
     if not chat_id or not text:
-        return jsonify(ok=False, error="chat_id and text are required"), 400
-
+        return jsonify({"ok": False, "error": "chat_id and text are required"}), 400
+    if not TELEGRAM_BOT_TOKEN:
+        return jsonify({"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN"}), 500
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    r = requests.post(url, json={"chat_id": chat_id, "text": text})
     try:
-        r = requests.post(TG_API, json={"chat_id": chat_id, "text": text, "parse_mode":"HTML"}, timeout=12)
-        try:
-            payload = r.json()
-        except Exception:
-            payload = {"raw": r.text}
-        return jsonify(ok=r.ok, status=r.status_code, telegram=payload), (200 if r.ok else 502)
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
+        j = r.json()
+    except Exception:
+        return jsonify({"ok": False, "error": f"Telegram non-JSON: {r.text[:120]}"}), 502
+    if not j.get("ok", False):
+        return jsonify({"ok": False, "error": j.get("description","telegram error")}), 400
+    # push to socket listeners
+    socketio.emit("tg_message", {"chat_id": chat_id, "text": text})
+    return jsonify({"ok": True, "result": j})
 
-# ====== AI chat (OpenAI + Gemini) ======
-@app.post("/chat")
-def chat():
+# ---------- AI Endpoint ----------
+def call_openai(prompt: str) -> str:
+    if not OPENAI_API_KEY: return "(OpenAI key missing)"
+    try:
+        # Minimal example using the responses API
+        import openai
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"system","content":"You are RaidenX8 AI assistant."},
+                      {"role":"user","content": prompt}],
+            temperature=0.4,
+        )
+        return res.choices[0].message.content.strip()
+    except Exception as e:
+        return f"(OpenAI error: {e})"
+
+def call_gemini(prompt: str) -> str:
+    if not GEMINI_API_KEY: return "(Gemini key missing)"
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        out = model.generate_content(prompt)
+        return out.text.strip()
+    except Exception as e:
+        return f"(Gemini error: {e})"
+
+@app.route("/ai", methods=["POST"])
+def ai():
     data = request.get_json(silent=True) or {}
+    message = str(data.get("message","")).strip()
     provider = (data.get("provider") or "openai").lower()
-    user_msg = (data.get("message") or "").strip()
-    history  = data.get("history") or []  # optional [{role, content}, ...]
+    if not message:
+        return jsonify({"ok": False, "error": "message required"}), 400
+    if provider == "gemini":
+        answer = call_gemini(message)
+    else:
+        answer = call_openai(message)
+    # push to socket listeners
+    socketio.emit("ai_reply", {"answer": answer})
+    return jsonify({"ok": True, "answer": answer})
 
-    if not user_msg:
-        return jsonify(ok=False, error="message is required"), 400
-
-    try:
-        if provider == "openai":
-            if not OPENAI_API_KEY:
-                return jsonify(ok=False, error="Missing OPENAI_API_KEY"), 500
-            # build messages
-            msgs = [{"role":"system","content":"You are a helpful assistant for RaidenX8 Gen-Z Trend."}]
-            if isinstance(history, list):
-                msgs += history
-            msgs.append({"role":"user","content":user_msg})
-
-            r = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"},
-                json={"model":"gpt-4o-mini", "messages":msgs, "temperature":0.4, "max_tokens":500},
-                timeout=20
-            )
+# ---------- Optional: simple Telegram inbound poller ----------
+def poll_telegram():
+    if not TELEGRAM_BOT_TOKEN: 
+        return
+    offset = None
+    while True:
+        try:
+            r = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                params={"timeout": 25, "offset": offset})
             j = r.json()
-            if r.status_code >= 400:
-                return jsonify(ok=False, error=j.get("error", j)), 502
-            text = j["choices"][0]["message"]["content"]
-            return jsonify(ok=True, provider="openai", text=text)
+            for u in j.get("result", []):
+                offset = u["update_id"] + 1
+                if "message" in u and "text" in u["message"]:
+                    m = u["message"]
+                    socketio.emit("tg_message", {
+                        "chat_id": m["chat"]["id"],
+                        "text": m["text"]
+                    })
+        except Exception:
+            time.sleep(2)
 
-        elif provider == "gemini":
-            if not GEMINI_API_KEY:
-                return jsonify(ok=False, error="Missing GEMINI_API_KEY"), 500
-            # Gemini 1.5 Flash
-            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-            parts = []
-            if isinstance(history, list):
-                for turn in history:
-                    if turn.get("role") == "user":
-                        parts.append({"role":"user","parts":[{"text":turn.get("content","")}]})
-                    else:
-                        parts.append({"role":"model","parts":[{"text":turn.get("content","")}]})
-            parts.append({"role":"user","parts":[{"text":user_msg}]})
-            r = requests.post(endpoint, json={"contents": parts}, timeout=20)
-            j = r.json()
-            if r.status_code >= 400:
-                return jsonify(ok=False, error=j), 502
-            text = j["candidates"][0]["content"]["parts"][0]["text"]
-            return jsonify(ok=True, provider="gemini", text=text)
-
-        else:
-            return jsonify(ok=False, error="Unsupported provider. Use 'openai' or 'gemini'."), 400
-
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
+import threading
+threading.Thread(target=poll_telegram, daemon=True).start()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    # eventlet is auto-chosen by SocketIO if installed
+    port = int(os.getenv("PORT", "10000"))
+    socketio.run(app, host="0.0.0.0", port=port)

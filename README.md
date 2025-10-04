@@ -1,19 +1,17 @@
-# RaidenX8 API (Flask + Socket.IO)
+# RaidenX8 API (Render + Socket.IO) — v8.2-patch.1
 
-## Env cần có (Render → Environment)
-- TELEGRAM_BOT_TOKEN=xxxxx
-- TELEGRAM_CHAT_ID=6142290415
-- (tuỳ chọn) OPENAI_API_KEY=sk-...
+Endpoints:
+- `GET /` health JSON
+- `POST /notify` {chat_id,text} → Telegram
+- `POST /ai` {provider:'openai'|'gemini', message}
 
-## Start command (Procfile)
-web: gunicorn server:app --preload --workers 1 --threads 4 --bind 0.0.0.0:$PORT
+Realtime (Socket.IO events):
+- `ai_reply` {answer}
+- `tg_message` {chat_id, text}
 
-## Endpoints
-- GET /           → "RaidenX8 API is up."
-- GET /health     → "ok"
-- GET /events     → {"events":[...]}
-- POST /send      → body {"text":"hello"}
-- POST /webhook   → Telegram POST vào đây
-
-## Set Telegram webhook
-https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<your-app>.onrender.com/webhook
+## Deploy (Render)
+- Create Web Service (Python 3).
+- Build Command: `pip install -r requirements.txt`
+- Start Command: `python server.py`
+- Set env vars: `TELEGRAM_BOT_TOKEN`, `OPENAI_API_KEY`, `GEMINI_API_KEY`.
+- After live, configure frontend RX_API_BASE to `https://<service>.onrender.com`.
