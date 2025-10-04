@@ -1,224 +1,134 @@
-# server.py  — RaidenX8 API (Render + Socket.IO, gthread)
-# ------------------------------------------------------
-# Features:
-#  - /health
-#  - /notify  -> Telegram sendMessage
-#  - /prices  -> Proxy CoinGecko (BTC, ETH, BNB, USDT, SOL, TON)
-#  - Socket.IO:
-#       * 'ticker:subscribe'  -> server đẩy giá định kỳ
-#       * 'ai:message'        -> gọi OpenAI/Gemini rồi bắn 'ai:chunk' / 'ai:done'
-#
-# Env vars cần có (Render dashboard):
-#   TELEGRAM_BOT_TOKEN, OPENAI_API_KEY (tuỳ chọn), GEMINI_API_KEY (tuỳ chọn)
-
-import os, time, threading, json, requests
-from typing import Dict, Any, List
-from flask import Flask, jsonify, request
+# server.py
+import os, time, threading, json
+from flask import Flask, request, jsonify, make_response
+from flask_cors import CORS
 from flask_socketio import SocketIO, emit
+import requests
 
-# ------------------- App & Socket.IO -------------------
+API_NAME = "raidenx8-api"
+FRONTEND = "https://raidenx8.pages.dev"
+
 app = Flask(__name__)
-socketio = SocketIO(
+app.config["JSON_SORT_KEYS"] = False
+
+# CORS mở đủ method + headers + credentials (nếu cần)
+CORS(
     app,
-    async_mode="threading",           # dùng gthread bên gunicorn
-    cors_allowed_origins="*",
-    logger=False,
-    engineio_logger=False
+    resources={r"/*": {
+        "origins": [FRONTEND, "*"],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+        "supports_credentials": False
+    }},
 )
 
-# ------------------- Config -------------------
-OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
-GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TICKER_INTERVAL  = int(os.getenv("TICKER_INTERVAL", "30"))
+# SocketIO: cho phép CORS từ Pages + fallback polling (Render free)
+socketio = SocketIO(
+    app,
+    cors_allowed_origins=[FRONTEND, "*"],
+    async_mode="gevent",   # hoặc "threading" nếu bạn không cài gevent
+    ping_timeout=25,
+    ping_interval=10
+)
 
-COINS = [
-    # (coingecko id, symbol hiển thị)
-    ("bitcoin",      "BTC"),
-    ("ethereum",     "ETH"),
-    ("binancecoin",  "BNB"),
-    ("tether",       "USDT"),
-    ("solana",       "SOL"),
-    ("the-open-network", "TON"),
-]
+# === Helpers ===
+def _ok(data=None, **kw):
+    base = {"ok": True}
+    if data and isinstance(data, dict):
+        base.update(data)
+    base.update(kw)
+    return jsonify(base)
 
-CG_ENDPOINT = "https://api.coingecko.com/api/v3/simple/price"
+def _err(msg, code=400):
+    return jsonify({"ok": False, "error": msg}), code
 
-# cache giá để tránh gọi quá nhiều
-_prices_cache: Dict[str, Any] = {"ts": 0, "data": []}
-_prices_lock = threading.Lock()
+@app.after_request
+def add_csp_headers(resp):
+    # đảm bảo preflight không bị chặn (nếu CF Pages strict)
+    resp.headers["Access-Control-Allow-Origin"] = FRONTEND
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
 
-# ------------------- Helpers -------------------
-def cg_fetch_prices() -> List[Dict[str, Any]]:
-    ids = ",".join([c[0] for c in COINS])
-    params = {"ids": ids, "vs_currencies": "usd", "include_24hr_change": "true"}
-    r = requests.get(CG_ENDPOINT, params=params, timeout=20)
-    r.raise_for_status()
-    j = r.json()
-
-    out = []
-    for cid, sym in COINS:
-        item = j.get(cid) or {}
-        price = item.get("usd")
-        chg   = item.get("usd_24h_change")
-        if price is None:
-            continue
-        # làm tròn nhẹ cho UI
-        try:
-            p = float(price)
-            c = float(chg) if chg is not None else 0.0
-        except Exception:
-            p, c = price, chg or 0
-        out.append({"symbol": sym, "price": p, "change24h": c})
-    return out
-
-def get_prices_cached(force=False) -> List[Dict[str, Any]]:
-    now = time.time()
-    with _prices_lock:
-        if force or now - _prices_cache["ts"] > 25:
-            try:
-                _prices_cache["data"] = cg_fetch_prices()
-                _prices_cache["ts"] = now
-            except Exception as e:
-                # nếu lỗi, giữ cache cũ
-                print("[prices] fetch error:", e)
-        return _prices_cache["data"]
-
-def chunk_emit(text: str, mid: str):
-    """Bắn text theo từng khối nhỏ để UI thấy 'stream'."""
-    CHUNK = 200
-    for i in range(0, len(text), CHUNK):
-        emit("ai:chunk", {"id": mid, "content": text[i:i+CHUNK]})
-        socketio.sleep(0.03)
-
-# ------------------- HTTP endpoints -------------------
-@app.get("/health")
+@app.route("/", methods=["GET"])
+@app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "service": "raidenx8-api"})
+    return _ok(service=API_NAME)
 
-@app.get("/prices")
-def prices_endpoint():
-    force = request.args.get("force") == "1"
-    data = get_prices_cached(force=force)
-    return jsonify({"ok": True, "data": data})
+@app.route("/telegram/notify", methods=["POST", "OPTIONS"])
+def telegram_notify():
+    if request.method == "OPTIONS":
+        return make_response("", 204)
 
-@app.post("/notify")
-def notify():
-    if not TELEGRAM_BOT_TOKEN:
-        return jsonify({"ok": False, "error": "TELEGRAM_BOT_TOKEN missing"}), 400
-    payload = request.get_json(force=True, silent=True) or {}
-    chat_id = payload.get("chat_id")
-    text    = payload.get("text")
-    if not chat_id or not text:
-        return jsonify({"ok": False, "error": "chat_id and text required"}), 400
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        return _err("Missing TELEGRAM_BOT_TOKEN", 500)
 
-    tg = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    r = requests.post(tg, json={"chat_id": chat_id, "text": text}, timeout=20)
+    data = request.get_json(silent=True) or {}
+    chat_id = str(data.get("chat_id") or "6142290415").strip()
+    text = str(data.get("text") or "").strip()
+    if not text:
+        return _err("text required")
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    r = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
+    if r.ok:
+        return _ok(sent=True, chat_id=chat_id)
+    return _err(f"telegram_http_{r.status_code}", r.status_code)
+
+# ---- Ticker ----
+def get_prices():
+    # Demo: lấy top BTC/ETH/BNB/SOL từ CoinGecko (đơn giản, không API key)
+    ids = "bitcoin,ethereum,binancecoin,solana,tether,usd-coin,toncoin,matic-network"
+    vs = "usd"
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies={vs}&include_24hr_change=true"
     try:
-        j = r.json()
-    except Exception:
-        j = {"ok": False, "error": r.text}
-    return jsonify(j), (200 if j.get("ok") else 400)
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        raw = r.json()
+        # đổi sang array cho frontend
+        out = []
+        mapping = {
+            "bitcoin":"BTC","ethereum":"ETH","binancecoin":"BNB","solana":"SOL",
+            "tether":"USDT","usd-coin":"USDC","toncoin":"TON","matic-network":"MATIC"
+        }
+        for k,v in mapping.items():
+            if k in raw:
+                out.append({
+                    "symbol": v,
+                    "price": raw[k]["usd"],
+                    "change24h": raw[k].get("usd_24h_change", 0.0)
+                })
+        return out
+    except Exception as e:
+        return {"error": str(e)}
 
-# ------------------- Socket events -------------------
+@app.route("/ticker", methods=["GET", "OPTIONS"])
+def ticker_http():
+    if request.method == "OPTIONS":
+        return make_response("", 204)
+    data = get_prices()
+    if isinstance(data, dict) and "error" in data:
+        return _err(data["error"], 502)
+    return _ok(prices=data, ts=int(time.time()))
+
+# Emit qua socket mỗi 30s
+def ticker_loop():
+    while True:
+        data = get_prices()
+        if not (isinstance(data, dict) and "error" in data):
+            socketio.emit("ticker", {"prices": data, "ts": int(time.time())})
+        time.sleep(30)
+
 @socketio.on("connect")
 def on_connect():
-    emit("server:hello", {"ok": True, "msg": "WS connected"})
+    emit("hello", {"msg": "socket connected", "service": API_NAME})
 
-@socketio.on("disconnect")
-def on_disconnect():
-    print("[ws] client disconnected")
+def ensure_bg():
+    t = threading.Thread(target=ticker_loop, daemon=True)
+    t.start()
 
-# Ticker: client gửi 'ticker:subscribe' -> server bắt đầu bắn giá định kỳ
-_ticker_thread = None
-_ticker_thread_lock = threading.Lock()
-_active_subscribers = 0
-
-def _ticker_loop():
-    while True:
-        data = get_prices_cached()
-        socketio.emit("ticker:update", {"data": data})
-        socketio.sleep(TICKER_INTERVAL)
-
-@socketio.on("ticker:subscribe")
-def on_ticker_sub(_data=None):
-    global _ticker_thread, _active_subscribers
-    with _ticker_thread_lock:
-        _active_subscribers += 1
-        if _ticker_thread is None:
-            _ticker_thread = socketio.start_background_task(_ticker_loop)
-    emit("ticker:ack", {"ok": True})
-
-@socketio.on("ticker:unsubscribe")
-def on_ticker_unsub(_data=None):
-    # để đơn giản free plan: không tắt thread, chỉ giảm đếm
-    global _active_subscribers
-    with _ticker_thread_lock:
-        _active_subscribers = max(0, _active_subscribers - 1)
-    emit("ticker:ack", {"ok": True})
-
-# ------------------- AI over WebSocket -------------------
-def call_openai(prompt: str) -> str:
-    if not OPENAI_API_KEY:
-        return "⚠️ OPENAI_API_KEY chưa cấu hình — trả lời mẫu.\n" + f"Bạn hỏi: {prompt}"
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    body = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {"role": "system", "content": "Bạn là trợ lý của RaidenX8, trả lời ngắn gọn, rõ, hữu ích."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.7,
-        "stream": False
-    }
-    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=60)
-    r.raise_for_status()
-    j = r.json()
-    return j["choices"][0]["message"]["content"].strip()
-
-def call_gemini(prompt: str) -> str:
-    if not GEMINI_API_KEY:
-        return "⚠️ GEMINI_API_KEY chưa cấu hình — trả lời mẫu.\n" + f"Bạn hỏi: {prompt}"
-    # REST v1beta generateContent
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-    body = {"contents": [{"parts": [{"text": prompt}]}]}
-    r = requests.post(url, json=body, timeout=60)
-    r.raise_for_status()
-    j = r.json()
-    try:
-        return j["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception:
-        return f"(Gemini) Unexpected response: {j}"
-
-@socketio.on("ai:message")
-def on_ai_message(payload):
-    """
-    payload:
-      { id: "msg-uuid", text: "...", provider: "openai"|"gemini" }
-    """
-    mid   = (payload or {}).get("id") or f"m{int(time.time()*1000)}"
-    text  = (payload or {}).get("text", "").strip()
-    prov  = ((payload or {}).get("provider") or "openai").lower()
-
-    if not text:
-        emit("ai:done", {"id": mid, "content": "Bạn chưa nhập câu hỏi."})
-        return
-
-    try:
-        if prov == "gemini":
-            reply = call_gemini(text)
-        else:
-            reply = call_openai(text)
-    except Exception as e:
-        reply = f"Xin lỗi, API hiện lỗi: {e}"
-
-    # chunk giả lập
-    chunk_emit(reply, mid)
-    emit("ai:done", {"id": mid, "content": ""})
-
-# ------------------- main -------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    # Dev run: python server.py
-    socketio.run(app, host="0.0.0.0", port=port)
+    ensure_bg()
+    # local run
+    socketio.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
