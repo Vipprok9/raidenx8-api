@@ -1,5 +1,6 @@
-flask==3.0.3
-flask-cors==4.0.1
+flask==2.3.3
+flask-cors==4.0.0
 flask-socketio==5.3.6
-requests==2.32.3
+eventlet==0.33.3
 gunicorn==21.2.0
+requests==2.32.3
