@@ -1,69 +1,101 @@
+import os, requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import os, requests, time
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Lấy biến môi trường từ Render (hoặc Pydroid3)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # có thể để trống
+# ====== ENV ======
+BOT_TOKEN       = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "").strip()
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "").strip()
 
-# ---- ROUTES ----
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage" if BOT_TOKEN else None
 
-@app.route("/")
+@app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "raidenx8-api", "time": int(time.time())})
+    return jsonify(ok=True, service="raidenx8-api")
 
-# --- Gửi Notify Telegram ---
-@app.route("/notify", methods=["POST"])
+# ====== Telegram notify ======
+@app.post("/notify")
 def notify():
+    data = request.get_json(silent=True) or {}
+    chat_id = str(data.get("chat_id", "")).strip()
+    text    = str(data.get("text", "")).strip()[:4000]
+
+    if not BOT_TOKEN:
+        return jsonify(ok=False, error="Missing TELEGRAM_BOT_TOKEN"), 500
+    if not chat_id or not text:
+        return jsonify(ok=False, error="chat_id and text are required"), 400
+
     try:
-        data = request.get_json(force=True)
-        message = data.get("text")
-        chat_id = data.get("chat_id") or TELEGRAM_CHAT_ID
-
-        if not TELEGRAM_BOT_TOKEN or not chat_id:
-            return jsonify({"ok": False, "error": "Missing Telegram credentials"}), 400
-
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        res = requests.post(url, json={"chat_id": chat_id, "text": message})
-        return jsonify({"ok": res.ok, "status_code": res.status_code})
+        r = requests.post(TG_API, json={"chat_id": chat_id, "text": text, "parse_mode":"HTML"}, timeout=12)
+        try:
+            payload = r.json()
+        except Exception:
+            payload = {"raw": r.text}
+        return jsonify(ok=r.ok, status=r.status_code, telegram=payload), (200 if r.ok else 502)
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify(ok=False, error=str(e)), 500
 
-
-# --- Chat AI (OpenAI / Gemini hoặc fallback demo) ---
-@app.route("/chat", methods=["POST"])
+# ====== AI chat (OpenAI + Gemini) ======
+@app.post("/chat")
 def chat():
+    data = request.get_json(silent=True) or {}
+    provider = (data.get("provider") or "openai").lower()
+    user_msg = (data.get("message") or "").strip()
+    history  = data.get("history") or []  # optional [{role, content}, ...]
+
+    if not user_msg:
+        return jsonify(ok=False, error="message is required"), 400
+
     try:
-        data = request.get_json(force=True)
-        message = data.get("message", "")
-        provider = data.get("provider", "openai").lower()
+        if provider == "openai":
+            if not OPENAI_API_KEY:
+                return jsonify(ok=False, error="Missing OPENAI_API_KEY"), 500
+            # build messages
+            msgs = [{"role":"system","content":"You are a helpful assistant for RaidenX8 Gen-Z Trend."}]
+            if isinstance(history, list):
+                msgs += history
+            msgs.append({"role":"user","content":user_msg})
 
-        # Nếu có key OpenAI thật thì gọi API
-        if OPENAI_API_KEY:
-            import openai
-            openai.api_key = OPENAI_API_KEY
-            completion = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": message}]
+            r = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"},
+                json={"model":"gpt-4o-mini", "messages":msgs, "temperature":0.4, "max_tokens":500},
+                timeout=20
             )
-            reply = completion.choices[0].message["content"]
-        else:
-            # Fallback demo (tự phản hồi)
-            if "price" in message.lower():
-                reply = "BTC đang quanh 120k$, ETH 4.4k$. Nguồn CoinGecko 🌐"
-            elif "hello" in message.lower() or "hi" in message.lower():
-                reply = "Xin chào 👋! Mình là RaidenX8 AI Assistant."
-            else:
-                reply = f"RaidenX8 (demo): bạn vừa nói “{message}”."
-        return jsonify({"reply": reply})
-    except Exception as e:
-        return jsonify({"reply": f"Lỗi: {str(e)}"}), 500
+            j = r.json()
+            if r.status_code >= 400:
+                return jsonify(ok=False, error=j.get("error", j)), 502
+            text = j["choices"][0]["message"]["content"]
+            return jsonify(ok=True, provider="openai", text=text)
 
+        elif provider == "gemini":
+            if not GEMINI_API_KEY:
+                return jsonify(ok=False, error="Missing GEMINI_API_KEY"), 500
+            # Gemini 1.5 Flash
+            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+            parts = []
+            if isinstance(history, list):
+                for turn in history:
+                    if turn.get("role") == "user":
+                        parts.append({"role":"user","parts":[{"text":turn.get("content","")}]})
+                    else:
+                        parts.append({"role":"model","parts":[{"text":turn.get("content","")}]})
+            parts.append({"role":"user","parts":[{"text":user_msg}]})
+            r = requests.post(endpoint, json={"contents": parts}, timeout=20)
+            j = r.json()
+            if r.status_code >= 400:
+                return jsonify(ok=False, error=j), 502
+            text = j["candidates"][0]["content"]["parts"][0]["text"]
+            return jsonify(ok=True, provider="gemini", text=text)
+
+        else:
+            return jsonify(ok=False, error="Unsupported provider. Use 'openai' or 'gemini'."), 400
+
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
