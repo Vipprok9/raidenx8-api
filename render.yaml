@@ -4,13 +4,20 @@ services:
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn -k gthread -w 1 --threads 16 -b 0.0.0.0:$PORT server:app"
     autoDeploy: true
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
+      - key: DEFAULT_CHAT_ID
+        value: "6142290415"
       - key: OPENAI_API_KEY
         sync: false
       - key: GEMINI_API_KEY
         sync: false
+      - key: COINGECKO_IDS
+        value: "bitcoin,ethereum,tether,binancecoin,solana,toncoin"
+      - key: CG_INTERVAL_SECONDS
+        value: "30"
