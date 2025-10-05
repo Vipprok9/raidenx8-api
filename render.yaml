@@ -2,5 +2,15 @@ services:
   - type: web
     name: raidenx8-api
     runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn --worker-class gevent -w 1 -b 0.0.0.0:$PORT server:app --timeout 120
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
