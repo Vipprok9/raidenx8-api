@@ -65,8 +65,17 @@ def health():
 @app.get("/prices")
 def prices():
     with _prices_lock:
-        arr = list(_prices.values()) if _prices else fetch_prices_once()
-    return jsonify({"data": arr})
+        has_cache = bool(_prices)
+    if not has_cache:
+        try:
+            arr = fetch_prices_once()
+        except Exception as e:
+            return jsonify({"data": [], "error": repr(e)}), 502
+        return jsonify({"data": arr})
+    else:
+        with _prices_lock:
+            arr = list(_prices.values())
+        return jsonify({"data": arr})
 
 # ===== AI via REST (fallback) =====
 @app.post("/ai/chat")
@@ -74,7 +83,7 @@ def ai_chat():
     data = request.get_json(force=True)
     return jsonify({"reply": run_ai(data.get("message",""), data.get("provider","openai"))})
 
-# ===== AI via WebSocket (2‑way) =====
+# ===== AI via WebSocket (2-way) =====
 @socketio.on("chat")
 def ws_chat(payload):
     msg = (payload or {}).get("message","")
@@ -88,17 +97,14 @@ def ws_chat(payload):
 def run_ai(user_msg: str, provider: str = "openai") -> str:
     provider = (provider or "openai").lower()
     if provider == "gemini" and GEMINI_KEY:
-        # Gemini 1.5 Pro
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_KEY}"
         payload = {"contents":[{"role":"user","parts":[{"text": user_msg}]}]}
         r = requests.post(url, json=payload, timeout=30)
         j = r.json()
         return j["candidates"][0]["content"]["parts"][0]["text"]
     else:
-        # OpenAI GPT‑4o‑mini
         import openai
         openai.api_key = OPENAI_KEY
-        # Using legacy-style API for simplicity
         resp = openai.ChatCompletion.create(
             model="gpt-4o-mini",
             messages=[
