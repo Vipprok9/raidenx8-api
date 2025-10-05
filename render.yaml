@@ -18,3 +18,6 @@ services:
       - key: FETCH_INTERVAL   # (tuỳ chọn) giây, mặc định 30
         value: "30"
         sync: false
+- key: CACHE_DIR
+        value: /tmp/tts_cache
+        sync: false
