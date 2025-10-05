@@ -1,6 +1,10 @@
-flask==3.0.3
-flask-cors==4.0.1
-flask-socketio==5.3.6
-python-socketio==5.11.2
-requests==2.32.3
-gunicorn==22.0.0
+flask
+flask-cors
+flask-socketio
+requests
+gunicorn
+eventlet==0.36.1
+openai>=1.35.0
+google-generativeai>=0.7.2
+google-cloud-texttospeech>=2.16.5
+azure-cognitiveservices-speech>=1.38.0
