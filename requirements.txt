@@ -1,12 +1,10 @@
-Flask>=3.0.0
-Flask-Cors>=4.0.0
-Flask-SocketIO>=5.3.4
-python-socketio>=5.11.0
-gevent>=24.2.1
-gevent-websocket>=0.10.1
-gunicorn>=21.2.0
-requests>=2.31.0
-openai>=1.6.0
-# TTS
-google-cloud-texttospeech==2.16.5   # dùng nếu có service account
-gTTS==2.5.3                         # fallback miễn phí
+Flask==3.0.3
+Flask-Cors==4.0.1
+Flask-SocketIO==5.3.6
+requests==2.32.3
+gevent==24.2.1
+gevent-websocket==0.10.1
+gunicorn==23.0.0
+openai==1.40.2
+google-generativeai==0.8.3
+gTTS==2.5.3

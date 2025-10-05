@@ -3,21 +3,23 @@ services:
     name: raidenx8-api
     runtime: python
     plan: free
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: FETCH_INTERVAL
+        value: "25"
+      - key: PRICE_CACHE_TTL
+        value: "15"
+      - key: CACHE_DIR
+        value: /tmp/tts_cache
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
     buildCommand: pip install -r requirements.txt
     startCommand: >
       gunicorn
         --worker-class geventwebsocket.gunicorn.workers.GeventWebSocketWorker
-        --workers 1 --threads 1
-        --bind 0.0.0.0:10000
+        --workers 1
+        --bind 0.0.0.0:$PORT
         server:app
-    envVars:
-      - key: OPENAI_API_KEY   # điền trong Render dashboard
-        sync: false
-      - key: GEMINI_API_KEY   # (tuỳ chọn) nếu dùng Gemini
-        sync: false
-      - key: FETCH_INTERVAL   # (tuỳ chọn) giây, mặc định 30
-        value: "30"
-        sync: false
-- key: CACHE_DIR
-        value: /tmp/tts_cache
-        sync: false
