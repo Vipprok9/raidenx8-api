@@ -14,19 +14,21 @@ CORS(app, resources={r"/*":{"origins":"*"}})
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 PRICES = []
-SYMS = [("bitcoin","BTC"),("ethereum","ETH"),("binancecoin","BNB"),("solana","SOL"),("tether","USDT"),("toncoin","TON")]
+SYMS = [("bitcoin","BTC"),("ethereum","ETH"),("binancecoin","BNB"),
+        ("solana","SOL"),("tether","USDT"),("toncoin","TON")]
 
 def fetch_prices():
     global PRICES
     ids = ",".join([x[0] for x in SYMS])
     try:
         r = requests.get("https://api.coingecko.com/api/v3/simple/price",
-                         params={"ids":ids,"vs_currencies":"usd","include_24hr_change":"true"}, timeout=12)
+            params={"ids":ids,"vs_currencies":"usd","include_24hr_change":"true"}, timeout=12)
         j = r.json()
         rows = []
         for cg_id, sym in SYMS:
             if cg_id in j:
-                price = float(j[cg_id]["usd"]); change = float(j[cg_id].get("usd_24h_change", 0.0))
+                price = float(j[cg_id]["usd"])
+                change = float(j[cg_id].get("usd_24h_change", 0.0))
                 rows.append({"symbol":sym,"price":price,"change":change})
         PRICES = rows
     except Exception as e:
@@ -35,11 +37,13 @@ def fetch_prices():
 def loop():
     while True:
         fetch_prices()
-        if PRICES: socketio.emit("prices", PRICES, broadcast=True)
+        if PRICES:
+            socketio.emit("prices", PRICES, broadcast=True)
         time.sleep(30)
 
 @app.get("/")
-def health(): return jsonify(ok=True, service="raidenx8-api v9.1")
+def health():
+    return jsonify(ok=True, service="raidenx8-api v9.1.1")
 
 @app.get("/prices")
 def prices():
@@ -49,11 +53,13 @@ def prices():
 @app.post("/notify-telegram")
 def notify_telegram():
     data = request.get_json(silent=True) or {}
-    chat_id = str(data.get("chatId","")).strip(); text = str(data.get("text","")).strip()
-    if not TELEGRAM_BOT_TOKEN or not chat_id or not text: return jsonify(ok=False, error="missing")
+    chat_id = str(data.get("chatId","")).strip()
+    text = str(data.get("text","")).strip()
+    if not TELEGRAM_BOT_TOKEN or not chat_id or not text:
+        return jsonify(ok=False, error="missing")
     try:
         tg_url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        resp=requests.post(tg_url,json={"chat_id":chat_id,"text":text,"parse_mode":"HTML"},timeout=10)
+        resp=requests.post(tg_url, json={"chat_id":chat_id,"text":text,"parse_mode":"HTML"}, timeout=10)
         return jsonify(ok=resp.ok)
     except Exception as e:
         return jsonify(ok=False, error=str(e))
@@ -61,7 +67,8 @@ def notify_telegram():
 @app.post("/ai/chat")
 def ai_chat():
     data = request.get_json(silent=True) or {}
-    provider=(data.get("provider") or "openai").lower(); message=(data.get("message") or "")[:4000]
+    provider=(data.get("provider") or "openai").lower()
+    message=(data.get("message") or "")[:4000]
     if provider.startswith("openai") and OPENAI_API_KEY:
         try:
             from openai import OpenAI
@@ -73,7 +80,8 @@ def ai_chat():
         try:
             import google.generativeai as genai
             genai.configure(api_key=GEMINI_API_KEY)
-            model=genai.GenerativeModel("gemini-1.5-pro"); r=model.generate_content(message)
+            model=genai.GenerativeModel("gemini-1.5-pro")
+            r=model.generate_content(message)
             return jsonify(reply=r.text)
         except Exception as e: return jsonify(reply=f"(Gemini lỗi) {e}")
     return jsonify(reply=f"(demo) Bạn hỏi: {message}")
@@ -81,36 +89,40 @@ def ai_chat():
 @app.post("/api/tts")
 def api_tts():
     data = request.get_json(force=True)
-    text=(data.get("text") or "").strip(); provider=(data.get("provider") or "google").lower()
-    voice=(data.get("voice") or "").strip(); lang=(data.get("lang") or "vi-VN").strip()
+    text=(data.get("text") or "").strip()
+    provider=(data.get("provider") or "google").lower()
+    voice=(data.get("voice") or "vi-VN-Neural2-C").strip()
+    lang=(data.get("lang") or "vi-VN").strip()
     if not text: return jsonify(ok=False, error="empty text"), 400
 
     if provider=="openai" and OPENAI_API_KEY:
         try:
             from openai import OpenAI
             client=OpenAI(api_key=OPENAI_API_KEY)
-            speech=client.audio.speech.with_streaming_response.create(model="gpt-4o-mini-tts", voice=voice or "alloy", input=text)
+            speech=client.audio.speech.with_streaming_response.create(
+                model="gpt-4o-mini-tts", voice="alloy", input=text)
             buf=io.BytesIO(speech.read()); buf.seek(0)
             return send_file(buf, mimetype="audio/mpeg", download_name="speech.mp3")
         except Exception as e: return jsonify(ok=False, error=f"openai: {e}"), 500
 
     if provider=="google":
-        if voice.lower()=="vi-vn-namminhneural": voice="vi-VN-Neural2-D"
+        if voice.lower()=="vi-vn-namminhneural": voice="vi-VN-Neural2-C"
         try:
             from google.cloud import texttospeech
             client=texttospeech.TextToSpeechClient()
             synthesis_input=texttospeech.SynthesisInput(text=text)
-            voice_sel=texttospeech.VoiceSelectionParams(language_code=lang, name=voice or "vi-VN-Neural2-D")
+            voice_sel=texttospeech.VoiceSelectionParams(language_code=lang, name=voice)
             audio_config=texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3, speaking_rate=1.0, pitch=0.0)
             audio=client.synthesize_speech(input=synthesis_input, voice=voice_sel, audio_config=audio_config)
             return send_file(io.BytesIO(audio.audio_content), mimetype="audio/mpeg", download_name="speech.mp3")
         except Exception as e: return jsonify(ok=False, error=f"google: {e}"), 500
 
     if provider=="azure":
-        if not (AZURE_SPEECH_KEY and AZURE_REGION): return jsonify(ok=False, error="missing AZURE_*"), 400
+        AZ=os.getenv("AZURE_SPEECH_KEY"); RG=os.getenv("AZURE_REGION")
+        if not (AZ and RG): return jsonify(ok=False, error="missing AZURE_*"), 400
         try:
             import azure.cognitiveservices.speech as speechsdk
-            speech_config=speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_REGION)
+            speech_config=speechsdk.SpeechConfig(subscription=AZ, region=RG)
             speech_config.speech_synthesis_voice_name = voice or "vi-VN-NamMinhNeural"
             synthesizer=speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
             result=synthesizer.speak_text_async(text).get()
@@ -123,7 +135,6 @@ def api_tts():
 
 def main():
     t=threading.Thread(target=loop, daemon=True); t.start()
-    from flask_socketio import SocketIO
     port=int(os.getenv("PORT","5000"))
     socketio.run(app, host="0.0.0.0", port=port, allow_unsafe_werkzeug=True)
 
