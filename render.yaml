@@ -11,6 +11,6 @@ services:
       - key: OPENAI_API_KEY
         sync: false
       - key: FETCH_INTERVAL
-        value: "30"          # TTL cache ticker (giây), tùy chọn
+        value: "8"              # giây: khoảng cập nhật ticker
       - key: CORS_ALLOW_ORIGINS
-        value: "*"           # đặt domain tĩnh nếu muốn siết chặt
+        value: "*"              # có thể thay bằng domain tĩnh của bạn
