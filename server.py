@@ -1,158 +1,146 @@
-# ============================================================
-# RaidenX8 API — Flask-SocketIO (gevent-websocket)
-# - /prices: giá crypto có cache + backoff (giảm rate-limit)
-# - WS 'prices': đẩy realtime
-# - WS 'chat'  : AI 2 chiều (OpenAI/Gemini) + rate-limit
-# - /ai/chat   : REST fallback
-# ============================================================
-
-from gevent import monkey
-monkey.patch_all()
-
-import os, time, threading, requests
-from flask import Flask, jsonify, request
+import os, io, hashlib, time
+from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
-from flask_socketio import SocketIO, emit
 
-# ---------- Config ----------
-API_BASE = "https://api.coingecko.com/api/v3/simple/price"
-SYMS = [
-    ("bitcoin","BTC"), ("ethereum","ETH"), ("binancecoin","BNB"),
-    ("solana","SOL"), ("ripple","XRP"), ("toncoin","TON"), ("tether","USDT")
-]
-FETCH_INTERVAL = int(os.getenv("FETCH_INTERVAL", "45"))   # giãn nhịp để đỡ limit
-OPENAI_KEY     = os.getenv("OPENAI_API_KEY", "")
-GEMINI_KEY     = os.getenv("GEMINI_API_KEY", "")
-CHAT_MIN_INTERVAL = float(os.getenv("CHAT_MIN_INTERVAL", "1.2"))  # giây / IP
+# ====== Config ======
+CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/tts_cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-# ---------- App ----------
+USE_GOOGLE = False
+GOOGLE_ERR = None
+try:
+    # Chỉ dùng Google Cloud TTS nếu đã set GOOGLE_APPLICATION_CREDENTIALS
+    # (file JSON service account) và lib import OK
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        from google.cloud import texttospeech as gtts_google
+        USE_GOOGLE = True
+except Exception as e:
+    GOOGLE_ERR = str(e)
+    USE_GOOGLE = False
+
+# Fallback miễn phí
+try:
+    from gtts import gTTS
+except Exception as e:
+    gTTS = None
+
 app = Flask(__name__)
 CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*")
 
-_prices_cache = {"data": [], "ts": 0}
-_cache_lock   = threading.Lock()
 
-# nhớ thời điểm chat cuối theo IP (rate-limit đơn giản)
-_client_last  = {}
-_rl_lock      = threading.Lock()
+# ====== Helpers ======
+def _sha1(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
-# ---------- Price fetch ----------
-def fetch_prices_once():
-    ids = ",".join(i[0] for i in SYMS)
-    p = {"ids": ids, "vs_currencies": "usd", "include_24hr_change": "true"}
-    r = requests.get(API_BASE, params=p, timeout=12)
-    r.raise_for_status()
-    data = r.json()
-    out = []
-    for cg, sym in SYMS:
-        j = data.get(cg, {})
-        out.append({
-            "symbol": sym,
-            "price":  float(j.get("usd", 0.0)),
-            "change": float(j.get("usd_24h_change", 0.0)),
-        })
-    return out
 
-def ticker_loop():
-    """vòng lặp nền: lấy giá, cache, emit WS; có backoff khi lỗi"""
-    global _prices_cache
-    backoff = 0
-    while True:
+def _voice_to_lang(voice: str) -> str:
+    """
+    'vi-VN-Wavenet-D' -> 'vi-VN'
+    'en-US-Neural2-F' -> 'en-US'
+    'vi' -> 'vi'
+    """
+    if not voice:
+        return "vi-VN"
+    if "-" in voice:
+        parts = voice.split("-")
+        if len(parts) >= 2:
+            return f"{parts[0]}-{parts[1]}"
+    return voice
+
+
+def synth_google(text: str, voice_name: str) -> bytes:
+    """Google Cloud Text-to-Speech -> MP3 bytes"""
+    client = gtts_google.TextToSpeechClient()
+
+    # Voice + language
+    language_code = _voice_to_lang(voice_name)
+    voice_params = gtts_google.VoiceSelectionParams(
+        language_code=language_code,
+        name=voice_name or "vi-VN-Wavenet-D",
+    )
+
+    audio_config = gtts_google.AudioConfig(
+        audio_encoding=gtts_google.AudioEncoding.MP3,
+        speaking_rate=1.0,
+        pitch=0.0,
+    )
+
+    synthesis_input = gtts_google.SynthesisInput(text=text)
+    resp = client.synthesize_speech(
+        input=synthesis_input, voice=voice_params, audio_config=audio_config
+    )
+    return resp.audio_content
+
+
+def synth_gtts(text: str, voice_name: str) -> bytes:
+    """gTTS (miễn phí) -> MP3 bytes"""
+    if gTTS is None:
+        raise RuntimeError("gTTS library not available.")
+    lang = _voice_to_lang(voice_name)
+    # gTTS dùng 'vi', 'en'… nên rút về 2 ký tự đầu
+    lang2 = lang.split("-")[0]
+    mp3_bytes_io = io.BytesIO()
+    gTTS(text=text, lang=lang2).write_to_fp(mp3_bytes_io)
+    mp3_bytes_io.seek(0)
+    return mp3_bytes_io.read()
+
+
+def synth_tts(text: str, voice: str) -> bytes:
+    if USE_GOOGLE:
         try:
-            arr = fetch_prices_once()
-            with _cache_lock:
-                _prices_cache = {"data": arr, "ts": time.time()}
-            socketio.emit("prices", {"data": arr})
-            backoff = 0
+            return synth_google(text, voice)
         except Exception as e:
-            print("Ticker error:", e)
-            backoff = min(backoff + 10, 120)  # tăng dần khi lỗi
-        time.sleep(max(FETCH_INTERVAL, backoff))
+            # fallback sang gTTS nếu Google lỗi
+            if gTTS is None:
+                raise
+            return synth_gtts(text, voice)
+    else:
+        return synth_gtts(text, voice)
 
-# ---------- Routes ----------
+
+def cache_path(text: str, voice: str) -> str:
+    key = _sha1(f"{voice}::{text}")
+    return os.path.join(CACHE_DIR, f"{key}.mp3")
+
+
+# ====== Routes ======
 @app.get("/health")
 def health():
-    return "ok"
+    return jsonify(
+        ok=True,
+        google_ready=USE_GOOGLE,
+        google_error=GOOGLE_ERR,
+        cache_dir=CACHE_DIR,
+    )
 
-@app.get("/prices")
-def prices():
-    """trả cache ngay lập tức; nếu stale >5 phút sẽ cố refresh 1 lần"""
-    with _cache_lock:
-        data = _prices_cache["data"]
-        ts   = _prices_cache["ts"]
-    if time.time() - ts > 300:
-        try:
-            fresh = fetch_prices_once()
-            with _cache_lock:
-                _prices_cache["data"] = fresh
-                _prices_cache["ts"]   = time.time()
-            data = fresh
-        except Exception:
-            pass
-    return jsonify({"data": data})
 
-@app.post("/ai/chat")
-def ai_chat():
-    d = request.get_json(force=True) or {}
-    ip = request.headers.get("x-forwarded-for", request.remote_addr) or "na"
-    if not allow_chat(ip):
-        return jsonify({"reply": "[rate-limit] vui lòng thử lại sau"}), 429
-    return jsonify({"reply": run_ai(d.get("message",""), d.get("provider","openai"))})
+@app.get("/api/tts")
+def api_tts():
+    text = request.args.get("text", "").strip()
+    voice = request.args.get("voice", "vi-VN-Wavenet-D")
+    if not text:
+        return jsonify(ok=False, error="Missing text"), 400
 
-# ---------- WebSocket ----------
-@socketio.on("chat")
-def ws_chat(payload):
-    msg = (payload or {}).get("message","")
-    provider = (payload or {}).get("provider","openai")
-    ip = request.headers.get("x-forwarded-for", request.remote_addr) or "na"
-    if not allow_chat(ip):
-        emit("chat_reply", {"reply":"[rate-limit] thử lại sau giây lát"}); return
+    cp = cache_path(text, voice)
+    if os.path.exists(cp):
+        # Cache hit
+        return send_file(cp, mimetype="audio/mpeg", as_attachment=False)
+
     try:
-        reply = run_ai(msg, provider)
+        audio = synth_tts(text, voice)
+        with open(cp, "wb") as f:
+            f.write(audio)
+        return send_file(io.BytesIO(audio), mimetype="audio/mpeg", as_attachment=False)
     except Exception as e:
-        reply = f"[AI error] {e}"
-    emit("chat_reply", {"reply": reply})
+        return jsonify(ok=False, error=str(e)), 500
 
-# ---------- Helpers ----------
-def allow_chat(ip: str) -> bool:
-    now = time.time()
-    with _rl_lock:
-        last = _client_last.get(ip, 0)
-        if now - last < CHAT_MIN_INTERVAL:
-            return False
-        _client_last[ip] = now
-    return True
 
-def run_ai(text: str, provider: str) -> str:
-    text = (text or "").strip() or "Xin chào từ RaidenX8!"
-    if provider == "gemini" and GEMINI_KEY:
-        url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-               "gemini-1.5-flash:generateContent?key=" + GEMINI_KEY)
-        payload = {"contents":[{"parts":[{"text": text}]}]}
-        r = requests.post(url, json=payload, timeout=30)
-        j = r.json()
-        try:
-            return j["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception:
-            return str(j)[:800]
-    else:
-        import openai
-        openai.api_key = OPENAI_KEY
-        resp = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role":"system","content":"You are RaidenX8 assistant. Be concise and friendly."},
-                {"role":"user","content": text},
-            ],
-            timeout=30
-        )
-        return resp["choices"][0]["message"]["content"]
+# Trang chủ đơn giản (tuỳ ý)
+@app.get("/")
+def root():
+    return "RaidenX8 TTS API is running. Use /api/tts?text=...&voice=vi-VN-Wavenet-D"
 
-# ---------- Boot ----------
-def _start_bg():
-    threading.Thread(target=ticker_loop, daemon=True).start()
-_start_bg()
-
+# ====== Local run ======
 if __name__ == "__main__":
-    socketio.run(app, host="0.0.0.0", port=int(os.getenv("PORT","10000")))
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, threaded=True)
