@@ -4,13 +4,17 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --worker-class gevent -w 1 -b 0.0.0.0:$PORT server:app --timeout 120
+    startCommand: >
+      gunicorn
+        --worker-class geventwebsocket.gunicorn.workers.GeventWebSocketWorker
+        --workers 1 --threads 1
+        --bind 0.0.0.0:10000
+        server:app
     envVars:
-      - key: TELEGRAM_BOT_TOKEN
+      - key: OPENAI_API_KEY   # điền trong Render dashboard
         sync: false
-      - key: TELEGRAM_CHAT_ID
+      - key: GEMINI_API_KEY   # (tuỳ chọn) nếu dùng Gemini
         sync: false
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: GEMINI_API_KEY
+      - key: FETCH_INTERVAL   # (tuỳ chọn) giây, mặc định 30
+        value: "30"
         sync: false
