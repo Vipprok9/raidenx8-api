@@ -1,142 +1,115 @@
-import os, time, threading, io, requests
-from flask import Flask, jsonify, request, send_file
+from gevent import monkey
+monkey.patch_all()
+
+import os, time, threading, requests
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "")
-AZURE_REGION = os.getenv("AZURE_REGION", "")
+# ===== CONFIG =====
+API_BASE = "https://api.coingecko.com/api/v3/simple/price"
+SYMS = [
+    ("bitcoin","BTC"),
+    ("ethereum","ETH"),
+    ("binancecoin","BNB"),
+    ("solana","SOL"),
+    ("ripple","XRP"),
+    ("toncoin","TON"),
+    ("tether","USDT"),
+]
+FETCH_INTERVAL = 30
+
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 app = Flask(__name__)
-CORS(app, resources={r"/*":{"origins":"*"}})
-socketio = SocketIO(app, cors_allowed_origins="*")
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
 
-PRICES = []
-SYMS = [("bitcoin","BTC"),("ethereum","ETH"),("binancecoin","BNB"),
-        ("solana","SOL"),("tether","USDT"),("toncoin","TON")]
+_prices = {}
+_prices_lock = threading.Lock()
 
-def fetch_prices():
-    global PRICES
+# ===== PRICE FETCH =====
+def fetch_prices_once():
     ids = ",".join([x[0] for x in SYMS])
-    try:
-        r = requests.get("https://api.coingecko.com/api/v3/simple/price",
-            params={"ids":ids,"vs_currencies":"usd","include_24hr_change":"true"}, timeout=12)
-        j = r.json()
-        rows = []
-        for cg_id, sym in SYMS:
-            if cg_id in j:
-                price = float(j[cg_id]["usd"])
-                change = float(j[cg_id].get("usd_24h_change", 0.0))
-                rows.append({"symbol":sym,"price":price,"change":change})
-        PRICES = rows
-    except Exception as e:
-        print("price fetch error:", e)
+    params = {"ids": ids, "vs_currencies": "usd", "include_24hr_change": "true"}
+    r = requests.get(API_BASE, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    out = []
+    for cg_id, sym in SYMS:
+        j = data.get(cg_id, {})
+        price = float(j.get("usd", 0.0))
+        change = float(j.get("usd_24h_change", 0.0))
+        out.append({"symbol": sym, "price": price, "change_24h": change})
+    return out
 
-def loop():
+def bg_loop():
+    global _prices
     while True:
-        fetch_prices()
-        if PRICES:
-            socketio.emit("prices", PRICES, broadcast=True)
-        time.sleep(30)
+        try:
+            arr = fetch_prices_once()
+            with _prices_lock:
+                _prices = {i["symbol"]: i for i in arr}
+            socketio.emit("prices", {"data": arr})
+        except Exception as e:
+            print("Ticker error:", e)
+        time.sleep(FETCH_INTERVAL)
 
-@app.get("/")
-def health():
-    return jsonify(ok=True, service="raidenx8-api v9.1.1")
+@app.get("/health")
+def health(): return "ok"
 
 @app.get("/prices")
 def prices():
-    if not PRICES: fetch_prices()
-    return jsonify(PRICES)
+    with _prices_lock:
+        arr = list(_prices.values()) if _prices else fetch_prices_once()
+    return jsonify({"data": arr})
 
-@app.post("/notify-telegram")
-def notify_telegram():
-    data = request.get_json(silent=True) or {}
-    chat_id = str(data.get("chatId","")).strip()
-    text = str(data.get("text","")).strip()
-    if not TELEGRAM_BOT_TOKEN or not chat_id or not text:
-        return jsonify(ok=False, error="missing")
-    try:
-        tg_url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        resp=requests.post(tg_url, json={"chat_id":chat_id,"text":text,"parse_mode":"HTML"}, timeout=10)
-        return jsonify(ok=resp.ok)
-    except Exception as e:
-        return jsonify(ok=False, error=str(e))
-
+# ===== AI CHAT =====
 @app.post("/ai/chat")
 def ai_chat():
-    data = request.get_json(silent=True) or {}
-    provider=(data.get("provider") or "openai").lower()
-    message=(data.get("message") or "")[:4000]
-    if provider.startswith("openai") and OPENAI_API_KEY:
-        try:
-            from openai import OpenAI
-            client=OpenAI(api_key=OPENAI_API_KEY)
-            r=client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":message}])
-            return jsonify(reply=r.choices[0].message.content)
-        except Exception as e: return jsonify(reply=f"(OpenAI lỗi) {e}")
-    if provider.startswith("gemini") and GEMINI_API_KEY:
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=GEMINI_API_KEY)
-            model=genai.GenerativeModel("gemini-1.5-pro")
-            r=model.generate_content(message)
-            return jsonify(reply=r.text)
-        except Exception as e: return jsonify(reply=f"(Gemini lỗi) {e}")
-    return jsonify(reply=f"(demo) Bạn hỏi: {message}")
-
-@app.post("/api/tts")
-def api_tts():
     data = request.get_json(force=True)
-    text=(data.get("text") or "").strip()
-    provider=(data.get("provider") or "google").lower()
-    voice=(data.get("voice") or "vi-VN-Neural2-C").strip()
-    lang=(data.get("lang") or "vi-VN").strip()
-    if not text: return jsonify(ok=False, error="empty text"), 400
+    user_msg = data.get("message", "")
+    provider = data.get("provider", "openai").lower()
+    try:
+        if provider == "gemini" and GEMINI_KEY:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_KEY}"
+            payload = {"contents": [{"role":"user","parts":[{"text": user_msg}]}]}
+            r = requests.post(url, json=payload, timeout=20)
+            j = r.json()
+            text = j["candidates"][0]["content"]["parts"][0]["text"]
+        else:
+            import openai
+            openai.api_key = OPENAI_KEY
+            resp = openai.ChatCompletion.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role":"system","content":"Bạn là trợ lý AI thân thiện, trả lời ngắn gọn bằng tiếng Việt."},
+                    {"role":"user","content":user_msg}
+                ]
+            )
+            text = resp["choices"][0]["message"]["content"].strip()
+        return jsonify({"reply": text})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    if provider=="openai" and OPENAI_API_KEY:
-        try:
-            from openai import OpenAI
-            client=OpenAI(api_key=OPENAI_API_KEY)
-            speech=client.audio.speech.with_streaming_response.create(
-                model="gpt-4o-mini-tts", voice="alloy", input=text)
-            buf=io.BytesIO(speech.read()); buf.seek(0)
-            return send_file(buf, mimetype="audio/mpeg", download_name="speech.mp3")
-        except Exception as e: return jsonify(ok=False, error=f"openai: {e}"), 500
+# ===== TELEGRAM NOTIFY =====
+@app.post("/notify-telegram")
+def notify():
+    text = request.json.get("text","")
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            timeout=8)
+        return jsonify(r.json())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    if provider=="google":
-        if voice.lower()=="vi-vn-namminhneural": voice="vi-VN-Neural2-C"
-        try:
-            from google.cloud import texttospeech
-            client=texttospeech.TextToSpeechClient()
-            synthesis_input=texttospeech.SynthesisInput(text=text)
-            voice_sel=texttospeech.VoiceSelectionParams(language_code=lang, name=voice)
-            audio_config=texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3, speaking_rate=1.0, pitch=0.0)
-            audio=client.synthesize_speech(input=synthesis_input, voice=voice_sel, audio_config=audio_config)
-            return send_file(io.BytesIO(audio.audio_content), mimetype="audio/mpeg", download_name="speech.mp3")
-        except Exception as e: return jsonify(ok=False, error=f"google: {e}"), 500
+def _ensure_bg(): threading.Thread(target=bg_loop, daemon=True).start()
+_ensure_bg()
 
-    if provider=="azure":
-        AZ=os.getenv("AZURE_SPEECH_KEY"); RG=os.getenv("AZURE_REGION")
-        if not (AZ and RG): return jsonify(ok=False, error="missing AZURE_*"), 400
-        try:
-            import azure.cognitiveservices.speech as speechsdk
-            speech_config=speechsdk.SpeechConfig(subscription=AZ, region=RG)
-            speech_config.speech_synthesis_voice_name = voice or "vi-VN-NamMinhNeural"
-            synthesizer=speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
-            result=synthesizer.speak_text_async(text).get()
-            if result.reason==speechsdk.ResultReason.SynthesizingAudioCompleted:
-                return send_file(io.BytesIO(result.audio_data), mimetype="audio/wav", download_name="speech.wav")
-            return jsonify(ok=False, error=str(result.reason)), 500
-        except Exception as e: return jsonify(ok=False, error=f"azure: {e}"), 500
-
-    return jsonify(ok=False, error="unknown provider"), 400
-
-def main():
-    t=threading.Thread(target=loop, daemon=True); t.start()
-    port=int(os.getenv("PORT","5000"))
-    socketio.run(app, host="0.0.0.0", port=port, allow_unsafe_werkzeug=True)
-
-if __name__=="__main__":
-    main()
+if __name__ == "__main__":
+    socketio.run(app, host="0.0.0.0", port=int(os.getenv("PORT","5000")))
