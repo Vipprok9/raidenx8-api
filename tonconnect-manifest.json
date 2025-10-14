@@ -1,9 +1,0 @@
-{
-  "url": "https://your-domain.example/",
-  "name": "RaidenX8",
-  "iconUrl": "https://your-domain.example/icon.png",
-  "termsOfUseUrl": "https://your-domain.example/terms",
-  "privacyPolicyUrl": "https://your-domain.example/privacy",
-  "bridgeUrl": "https://bridge.tonapi.io/bridge",
-  "universalUrl": "https://app.tonkeeper.com/ton-connect"
-}
