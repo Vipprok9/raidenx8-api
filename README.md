@@ -1,17 +1,22 @@
-# RaidenX8 — Zing MP3 Proxy (Node.js)
+# AI Singing Backend Proxy
 
 ## Endpoints
-- `GET /music/search?q=term` → `{ q, count, items:[{id,title,artist,thumbnail,duration}] }`
-- `GET /music/stream?id=encodeId` → `{ id, url }` (add `?redirect=1` for 302)
-- `GET /music/lyric?id=encodeId` → `{ id, lyric }`
-- `GET /healthz` → `ok`
+- `POST /ai/sing` → Body `{ "lyrics": "...", "style": "edm_remix_bass" }` → Returns `{ "audio_url": "<mp3>" }`
 
-## Render Deploy
-- Runtime: Node 18+
-- Build: `npm i`
-- Start: `npm start`
-- Env: `PORT=8080`, `CORS_ORIGINS=https://your-frontend-domain`
+## Quick Deploy on Render
+1. New Web Service → upload `server.py`, `requirements.txt`.
+2. Start command:
+   ```
+   gunicorn -w 1 -b 0.0.0.0:$PORT server:app
+   ```
+3. (Optional) Set ENV:
+   - `PROVIDER=goapi` (hoặc `custom` hoặc để trống để chạy demo)
+   - `PROVIDER_URL` = endpoint provider (ví dụ cho `custom`)
+   - `PROVIDER_KEY` = API key của provider
 
-## Notes
-- Tuân thủ bản quyền. Một số stream có thể thay đổi định kỳ.
-- Render free có cold start.
+## Test
+```
+curl -X POST https://<service>.onrender.com/ai/sing   -H "Content-Type: application/json"   -d '{"lyrics":"La la la~ love remix","style":"edm_remix_bass"}'
+```
+
+Nếu `PROVIDER=none` (mặc định), API trả về mp3 demo để frontend phát thử.

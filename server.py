@@ -1,83 +1,66 @@
-# --- TTS + Voice Story ---
-from flask import Flask, request, jsonify, send_file
-from google.cloud import texttospeech as gtts
-from bs4 import BeautifulSoup
-import re, io, time, requests
+# server.py — AI Singing backend proxy (Flask)
+# Routes:
+#  POST /ai/sing  {lyrics, style} → returns {"audio_url": "<mp3>"}
+# Environment:
+#  PROVIDER (none|goapi|custom), PROVIDER_URL, PROVIDER_KEY
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import os, requests
 
-TTS_DEFAULT_VOICE = "vi-VN-Neural2-C"     # nữ Việt êm, to, rõ
-TTS_DEFAULT_RATE  = 1.0                   # tốc độ
-TTS_DEFAULT_PITCH = -1.0                  # trầm nhẹ, đỡ chói
+app = Flask(__name__)
+CORS(app)
 
-def _html_to_text(html):
-    soup = BeautifulSoup(html, "html.parser")
-    # Xóa script/style
-    for tag in soup(["script", "style", "noscript"]): tag.decompose()
-    text = soup.get_text("\n")
-    text = re.sub(r"\n{2,}", "\n", text).strip()
-    return text
+@app.get("/health")
+def health():
+    return {"ok": True}
 
-def _fetch_story_text(title_or_url: str) -> str:
-    # Nếu là URL: tải và bóc nội dung
-    if title_or_url.startswith("http"):
-        r = requests.get(title_or_url, timeout=12)
-        r.raise_for_status()
-        raw = _html_to_text(r.text)
-        # Heuristic: chỉ giữ đoạn dài (loại menu/nhận xét)
-        parts = [p.strip() for p in raw.split("\n") if len(p.strip()) > 40]
-        return "\n".join(parts[:1200])  # giới hạn an toàn ~100k ký tự
-    # Nếu là tên: tạo prompt mở đầu (demo, sau nâng cấp sẽ crawl theo tên)
-    return f"Truyện: {title_or_url}. Mở đầu: {title_or_url} — đây là phần giới thiệu ngắn để đọc thử. Bạn có thể dán URL chương để đọc toàn văn."
-
-def synth_gcloud(text, voice=TTS_DEFAULT_VOICE, rate=TTS_DEFAULT_RATE, pitch=TTS_DEFAULT_PITCH):
-    client = gtts.TextToSpeechClient()
-    synthesis_input = gtts.SynthesisInput(text=text)
-    voice_sel = gtts.VoiceSelectionParams(
-        language_code="vi-VN",
-        name=voice
-    )
-    audio_config = gtts.AudioConfig(
-        audio_encoding=gtts.AudioEncoding.MP3,
-        speaking_rate=rate,
-        pitch=pitch,
-        volume_gain_db=6.0  # BOOST to hơn Web Speech
-    )
-    resp = client.synthesize_speech(
-        input=synthesis_input, voice=voice_sel, audio_config=audio_config
-    )
-    return resp.audio_content
-
-@app.post("/api/tts")
-def api_tts():
-    """
-    Body: { "text": "...", "voice": "vi-VN-Neural2-C", "rate": 1.0, "pitch": -1.0 }
-    Trả về: audio/mp3
-    """
+@app.post("/ai/sing")
+def ai_sing():
     data = request.get_json(force=True)
-    text  = data.get("text","")[:100000]
-    voice = data.get("voice", TTS_DEFAULT_VOICE)
-    rate  = float(data.get("rate", TTS_DEFAULT_RATE))
-    pitch = float(data.get("pitch", TTS_DEFAULT_PITCH))
-    if not text.strip():
-        return jsonify({"error":"empty_text"}), 400
+    lyrics = data.get("lyrics","").strip()
+    style = data.get("style","edm_remix_bass")
+    if not lyrics:
+        return jsonify({"error":"missing lyrics"}), 400
 
-    mp3 = synth_gcloud(text, voice, rate, pitch)
-    return send_file(io.BytesIO(mp3), mimetype="audio/mpeg",
-                     as_attachment=False,
-                     download_name=f"tts_{int(time.time())}.mp3")
+    provider = os.getenv("PROVIDER","none").lower()
+    if provider == "goapi":
+        # Example schema for a third-party Suno wrapper (adjust per provider docs)
+        url = os.getenv("PROVIDER_URL", "https://api.goapi.ai/suno/create")
+        key = os.getenv("PROVIDER_KEY","")
+        payload = {
+            "prompt": lyrics,
+            "style": style,
+            "title": "AI Song",
+        }
+        headers = {"Authorization": f"Bearer {key}","Content-Type":"application/json"}
+        r = requests.post(url, json=payload, headers=headers, timeout=120)
+        try:
+            j = r.json()
+        except Exception:
+            return jsonify({"error":"provider_bad_json","text":r.text}), 502
+        audio_url = j.get("audio_url") or j.get("data",{}).get("audio_url")
+        if not audio_url:
+            return jsonify({"error":"provider_no_audio_url","resp":j}), 502
+        return jsonify({"audio_url": audio_url, "provider":"goapi"})
+    elif provider == "custom":
+        # Generic passthrough to your own webhook. It must return {"audio_url": "..."}.
+        url = os.getenv("PROVIDER_URL")
+        key = os.getenv("PROVIDER_KEY","")
+        if not url:
+            return jsonify({"error":"missing PROVIDER_URL"}), 500
+        headers = {"Authorization": f"Bearer {key}","Content-Type":"application/json"} if key else {"Content-Type":"application/json"}
+        r = requests.post(url, json={"lyrics":lyrics,"style":style}, headers=headers, timeout=120)
+        try:
+            j = r.json()
+        except Exception:
+            return jsonify({"error":"custom_bad_json","text":r.text}), 502
+        if "audio_url" not in j:
+            return jsonify({"error":"custom_no_audio_url","resp":j}), 502
+        return jsonify({"audio_url": j["audio_url"], "provider":"custom"})
+    else:
+        # Demo mode
+        demo_audio = "https://filesamples.com/samples/audio/mp3/sample3.mp3"
+        return jsonify({"audio_url": demo_audio, "provider":"demo"})
 
-@app.post("/voice/read")
-def voice_read():
-    """
-    Body: { "query":"<tên truyện hoặc URL>", "provider":"gemini" }
-    → Lấy nội dung (nếu URL) + tổng hợp TTS → trả MP3
-    """
-    data = request.get_json(force=True)
-    q = (data.get("query") or "").strip()
-    if not q:
-        return jsonify({"error":"empty_query"}), 400
-
-    text = _fetch_story_text(q)[:95000]
-    mp3 = synth_gcloud(text)
-    return send_file(io.BytesIO(mp3), mimetype="audio/mpeg",
-                     as_attachment=False,
-                     download_name=f"voice_story_{int(time.time())}.mp3")
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))

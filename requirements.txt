@@ -2,5 +2,3 @@ flask
 flask-cors
 requests
 gunicorn
-google-cloud-texttospeech==2.*   # TTS thật (Google/Vertex)
-beautifulsoup4                   # lấy text từ URL chương truyện
