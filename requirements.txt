@@ -1,8 +1,6 @@
-flask==3.0.3
-flask-cors==4.0.1
-flask-socketio==5.3.6
-python-socketio==5.11.3
-eventlet==0.36.1
-gunicorn==21.2.0
-google-generativeai
-requests
+flask
+flask-cors
+flask-socketio
+gunicorn
+gevent
+gevent-websocket
