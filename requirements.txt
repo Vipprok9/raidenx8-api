@@ -1,5 +1,6 @@
 flask
 flask-cors
-gunicorn
+flask-socketio
+eventlet
 requests
-gTTS==2.5.1
+gunicorn
