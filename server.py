@@ -1,199 +1,104 @@
-import os, json, time, requests, re
-from flask import Flask, request, Response, jsonify
+import os, json, requests
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-from functools import lru_cache
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 app = Flask(__name__)
 CORS(app)
 
+# ==== Cấu hình ====
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash")
-GEN_URL_STREAM = f"https://generativelanguage.googleapis.com/v1beta/{GEMINI_MODEL}:streamGenerateContent"
+MODEL_FAST = os.getenv("GEMINI_MODEL_FAST", "models/gemini-2.5-flash")
+MODEL_SMART = os.getenv("GEMINI_MODEL_SMART", "models/gemini-2.5-pro")
+GEN_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
+# ==== Session tối ưu tốc độ ====
+session = requests.Session()
+retries = Retry(total=1, backoff_factor=0.2, status_forcelist=[429, 500, 502, 503, 504])
+session.mount("https://", HTTPAdapter(max_retries=retries, pool_connections=50, pool_maxsize=50))
+session.headers.update({"Connection": "keep-alive"})
+
+# ==== Prompt & Few-shot (giảm “chung chung”) ====
 SYS_PROMPT = (
-    "Bạn là RaidenX8 – trợ lý Gen-Z quốc tế, trả lời NGẮN – THẲNG – CÓ SỐ.\n"
-    "Quy tắc:\n"
-    "- Luôn mở đầu bằng đáp án hoặc kết luận 1 câu.\n"
-    "- Sau đó cho 3–5 gạch đầu dòng hành động/số liệu/ví dụ cụ thể.\n"
-    "- Nếu server đã cung cấp dữ liệu (thời tiết/giá coin), PHẢI dùng, KHÔNG nói 'hãy tự lên Google'.\n"
-    "- Không dùng ký tự ** hoặc * để in đậm. Không nói 'với tư cách là AI'.\n"
+  "Bạn là RaidenX8 – AI Gen-Z, phản hồi NGẮN, THẲNG, CỤ THỂ.\n"
+  "• Mở đầu = 1 câu kết luận rõ ràng.\n"
+  "• Sau đó 3–5 bullet: số liệu, ví dụ, bước hành động.\n"
+  "• Nếu có dữ liệu server (weather/price) → dùng ngay; KHÔNG nói 'hãy lên Google'.\n"
+  "• Không dùng ký tự ** hoặc *; không nói 'với tư cách là AI'.\n"
+  "• Nếu chưa chắc: nêu giả định + bước kiểm chứng ngắn.\n"
+  "Giữ văn phong tự nhiên, dễ hiểu."
 )
 
-BAD_PHRASES = [
-    "với tư cách là một ai", "as an ai", "tôi không thể truy cập", "hãy tìm trên google",
-    "tôi không có khả năng", "i cannot access real-time", "as a language model"
+FEWSHOT = [
+  {"role":"user","parts":[{"text":"Tối ưu SEO trang NFT?"}]},
+  {"role":"model","parts":[{"text":"Tập trung tốc độ + từ khóa NFT.\n- LCP <2.5s, CLS <0.1\n- <title>/<meta> chứa NFT, Solana\n- Schema Product JSON-LD\n- Hình WebP + lazy load"}]},
+  {"role":"user","parts":[{"text":"Cách tăng tương tác cộng đồng Web3?"}]},
+  {"role":"model","parts":[{"text":"Tạo minigame + phần thưởng rõ ràng.\n- AMA hàng tuần + giveaway\n- Leaderboard token\n- Social quest (Zealy)\n- Thu thập feedback → airdrop nhỏ"}]},
 ]
 
-def clean_text(t: str) -> str:
-    if not t:
-        return t
-    t = t.replace("*", "")
-    for s in BAD_PHRASES:
-        t = t.replace(s, "")
-    # gọn dòng, bỏ đuôi trống
-    lines = [ln.rstrip() for ln in t.splitlines()]
-    lines = [ln for ln in lines if ln.strip()]
-    return "\n".join(lines)
+BAD_PHRASES = [
+  "as an ai", "với tư cách là", "hãy tìm trên google",
+  "tôi không thể truy cập", "i cannot access", "as a language model"
+]
 
-def sse_pack(text: str):
-    return f"data: {text}\n\n"
+def _clean(text: str) -> str:
+    if not text: return ""
+    for s in BAD_PHRASES: text = text.replace(s, "")
+    text = text.replace("*", "").strip()
+    return "\n".join([ln.strip() for ln in text.splitlines() if ln.strip()])
+
+def _is_generic(t: str) -> bool:
+    if not t: return True
+    low = t.lower()
+    generic = ["tùy trường hợp", "hãy tìm hiểu thêm", "không thể cung cấp", "có thể cân nhắc"]
+    return any(k in low for k in generic) or len(t.split()) < 25
+
+def _choose_model(q: str) -> str:
+    if len(q) > 140 or any(k in q.lower() for k in ["tại sao","phân tích","so sánh","thuật toán","design","vì sao"]):
+        return MODEL_SMART
+    return MODEL_FAST
+
+def gemini_call(question: str, retry: bool = True) -> str:
+    model = _choose_model(question)
+    url = f"{GEN_BASE}/{model}:generateContent?key={GEMINI_API_KEY}"
+    contents = [{"role":"user","parts":[{"text": SYS_PROMPT}]}, *FEWSHOT,
+                {"role":"user","parts":[{"text": question}]}]
+    payload = {
+        "contents": contents,
+        "generationConfig": {"temperature": 0.45, "topK": 40, "topP": 0.9, "maxOutputTokens": 384}
+    }
+    try:
+        r = session.post(url, json=payload, timeout=(3.5, 8))
+        if not r.ok:
+            return "Mạng hơi chậm, thử lại giúp mình nhé."
+        t = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        return "Hơi kẹt, thử lại giúp mình nhé."
+
+    t = _clean(t)
+
+    # Nếu còn chung chung → reprompt 1 lần yêu cầu cụ thể hóa
+    if retry and _is_generic(t):
+        payload["contents"].append({"role":"user","parts":[{"text":"Cụ thể hơn: thêm số/bước/ví dụ, 3–5 bullet, ngắn gọn."}]})
+        try:
+            r2 = session.post(url, json=payload, timeout=(3.5, 8))
+            if r2.ok:
+                t2 = _clean(r2.json()["candidates"][0]["content"]["parts"][0]["text"])
+                if not _is_generic(t2):
+                    return t2
+        except Exception:
+            pass
+    return t
+
+@app.post("/ai/chat_sync")
+def chat_sync():
+    data = request.get_json(force=True)
+    q = (data.get("message") or "").strip()
+    if not q:
+        return jsonify({"error": "missing message"}), 400
+    return jsonify({"reply": gemini_call(q)})
 
 @app.get("/health")
 def health():
-    return {"ok": True, "model": GEMINI_MODEL}
-
-# ---------------------- Routers: Weather / Prices ---------------------- #
-
-@lru_cache(maxsize=64)
-def _geo_lookup(city: str):
-    # Open-Meteo geocoding (no key)
-    url = "https://geocoding-api.open-meteo.com/v1/search"
-    r = requests.get(url, params={"name": city, "language": "vi", "count": 1, "format": "json"}, timeout=5)
-    j = r.json()
-    if j.get("results"):
-        res = j["results"][0]
-        return {"lat": res["latitude"], "lon": res["longitude"], "name": res["name"], "country": res.get("country")}
-    return None
-
-def get_weather(query: str):
-    # bắt city từ câu hỏi
-    m = re.search(r"(thời tiết|mưa|nắng|nhiệt độ).*(?:tại|ở)\s+([A-Za-zÀ-ỹ\s]+)", query, re.IGNORECASE)
-    city = m.group(2).strip() if m else "Huế"
-    g = _geo_lookup(city)
-    if not g:
-        return None
-    url = "https://api.open-meteo.com/v1/forecast"
-    r = requests.get(url, params={
-        "latitude": g["lat"], "longitude": g["lon"],
-        "current": "temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m,precipitation",
-        "timezone": "auto"
-    }, timeout=5)
-    j = r.json().get("current", {})
-    if not j:
-        return None
-    return {
-        "city": g["name"], "country": g.get("country"),
-        "temp": j.get("temperature_2m"), "feels": j.get("apparent_temperature"),
-        "hum": j.get("relative_humidity_2m"), "wind": j.get("wind_speed_10m"),
-        "rain": j.get("precipitation")
-    }
-
-def get_price(asset: str):
-    # map nhanh vài coin phổ biến
-    slug = {
-        "btc": "bitcoin", "bitcoin": "bitcoin",
-        "eth": "ethereum", "ethereum": "ethereum",
-        "bnb": "binancecoin", "sol": "solana", "ton": "the-open-network",
-        "xrp": "ripple", "usdt":"tether", "usdc":"usd-coin"
-    }.get(asset.lower(), asset.lower())
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    r = requests.get(url, params={"ids": slug, "vs_currencies": "usd"}, timeout=5)
-    j = r.json()
-    if slug in j:
-        return {"asset": slug, "usd": j[slug]["usd"]}
-    return None
-
-def looks_like_weather(q: str) -> bool:
-    return bool(re.search(r"\b(thời tiết|mưa|nắng|gió|nhiệt độ)\b", q, re.IGNORECASE))
-
-def looks_like_price(q: str) -> str | None:
-    m = re.search(r"(giá|price)\s+([a-zA-Z]{2,6})", q, re.IGNORECASE)
-    return m.group(2) if m else None
-
-# ---------------------- Gemini Stream ---------------------- #
-
-def gemini_stream_reply(user_text: str):
-    if not GEMINI_API_KEY:
-        yield sse_pack("⚠️ Chưa cấu hình GEMINI_API_KEY ở Render.")
-        return
-    payload = {
-        "contents": [
-            {"role": "user", "parts": [{"text": f"{SYS_PROMPT}\n\nNgười dùng: {user_text}"}]}
-        ],
-        "generationConfig": {
-            "temperature": 0.5, "topK": 40, "topP": 0.9, "maxOutputTokens": 512
-        }
-    }
-    try:
-        with requests.post(
-            f"{GEN_URL_STREAM}?key={GEMINI_API_KEY}",
-            json=payload, timeout=8, stream=True, headers={"Connection": "keep-alive"}
-        ) as r:
-            buff = []
-            for line in r.iter_lines(decode_unicode=True):
-                if not line: 
-                    continue
-                # mỗi dòng JSON nhỏ chứa parts[].text
-                try:
-                    if line.startswith("data:"):
-                        line = line[5:].strip()
-                    obj = json.loads(line)
-                    parts = obj.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                    chunk = "".join(p.get("text", "") for p in parts)
-                    if not chunk:
-                        continue
-                    chunk = clean_text(chunk)
-                    if chunk:
-                        buff.append(chunk)
-                        yield sse_pack(chunk)
-                except Exception:
-                    # dòng keepalive hoặc định dạng khác → bỏ qua
-                    continue
-            # đóng gói đảm bảo có ít nhất dấu chấm câu kết thúc
-            if buff:
-                yield sse_pack("\n")
-    except requests.exceptions.Timeout:
-        yield sse_pack("⏱️ Hệ thống hơi chậm, thử lại giúp mình nhé.")
-    except Exception as e:
-        yield sse_pack(f"⚠️ Lỗi: {str(e)[:120]}")
-
-@app.post("/ai/chat")
-def ai_chat():
-    data = request.get_json(silent=True) or {}
-    text = (data.get("message") or "").strip()
-    if not text:
-        return jsonify({"error": "missing message"}), 400
-
-    # Router trước để trả lời có số liệu thật (siêu nhanh)
-    asset = looks_like_price(text)
-    if asset:
-        pr = get_price(asset)
-        if pr:
-            msg = f"Giá {asset.upper()}: ~{pr['usd']:,} USD.\n- Nguồn nhanh: CoinGecko.\n- Nhắc: giá biến động theo giây."
-            return jsonify({"reply": msg})
-
-    if looks_like_weather(text):
-        w = get_weather(text)
-        if w:
-            msg = (
-                f"Thời tiết {w['city']}: {w['temp']}°C, thể cảm {w['feels']}°C.\n"
-                f"- Ẩm: {w['hum']}%\n- Gió: {w['wind']} km/h\n- Lượng mưa: {w['rain']} mm/h"
-            )
-            return jsonify({"reply": msg})
-
-    # Không vào rule → gọi Gemini (stream SSE)
-    return Response(gemini_stream_reply(text), mimetype="text/event-stream")
-
-# fallback reply không stream, nếu frontend cần
-@app.post("/ai/chat_sync")
-def ai_chat_sync():
-    data = request.get_json(silent=True) or {}
-    text = (data.get("message") or "").strip()
-    if not text:
-        return jsonify({"error": "missing message"}), 400
-
-    payload = {
-        "contents":[{"role":"user","parts":[{"text": f"{SYS_PROMPT}\n\nNgười dùng: {text}"}]}],
-        "generationConfig":{"temperature":0.5,"topK":40,"topP":0.9,"maxOutputTokens":512}
-    }
-    url = f"https://generativelanguage.googleapis.com/v1beta/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    r = requests.post(url, json=payload, timeout=12)
-    j = r.json()
-    try:
-        t = "".join(p.get("text","") for p in j["candidates"][0]["content"]["parts"])
-    except Exception:
-        t = "Xin lỗi, có lỗi khi tạo câu trả lời."
-    return jsonify({"reply": clean_text(t)})
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), debug=False)
+    return jsonify({"ok": True, "model_fast": MODEL_FAST, "model_smart": MODEL_SMART})
