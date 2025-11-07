@@ -1,45 +1,47 @@
-# server.py
-import os
-import time
-import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import os, requests
 
 app = Flask(__name__)
 CORS(app)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
+# ==== Biến môi trường ====
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = "models/gemini-1.5-flash"  # hoặc "models/gemini-1.5-pro"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 
-@app.get("/health")
+# ==== Endpoint kiểm tra ====
+@app.route("/health")
 def health():
-    return jsonify({"status": "ok", "ts": int(time.time())})
+    return jsonify({"status": "ok"}), 200
 
-def ask_gemini(prompt: str) -> str:
-    """Gọi Gemini 1 lần, không gọi lặp/đệ quy."""
-    if not GEMINI_API_KEY:
-        return "Thiếu GEMINI_API_KEY."
-    try:
-        r = requests.post(
-            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-            json={"contents": [{"parts": [{"text": prompt}]}]},
-            timeout=30,
-        )
-        data = r.json()
-        if "candidates" not in data:
-            return f"Lỗi Gemini: {data}"
-        return data["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as e:
-        return f"Lỗi Gemini: {e}"
-
-@app.post("/ai/chat")
+# ==== Endpoint chat AI ====
+@app.route("/ai/chat", methods=["POST"])
 def ai_chat():
-    data = request.get_json(silent=True) or {}
-    msg = (data.get("message") or "").strip()
-    if not msg:
-        return jsonify({"reply": "Bạn chưa nhập nội dung."}), 400
-    reply = ask_gemini(msg)
-    return jsonify({"reply": reply})
+    try:
+        data = request.get_json(force=True)
+        message = data.get("message", "")
+        if not message:
+            return jsonify({"reply": "Thiếu nội dung tin nhắn"}), 400
+
+        payload = {
+            "contents": [
+                {"role": "user", "parts": [{"text": message}]}
+            ]
+        }
+
+        resp = requests.post(GEMINI_URL, json=payload, timeout=20)
+        result = resp.json()
+
+        if "candidates" in result:
+            reply = result["candidates"][0]["content"]["parts"][0]["text"]
+        else:
+            reply = f"Lỗi Gemini: {result}"
+
+        return jsonify({"reply": reply})
+    except Exception as e:
+        return jsonify({"reply": f"Lỗi server: {e}"}), 500
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
