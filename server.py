@@ -1,121 +1,192 @@
-import os
-import uuid
-import tempfile
-from flask import Flask, request, jsonify, send_file
+import os, time, json, requests
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
-import requests
-from gtts import gTTS
+from flask_socketio import SocketIO, emit
 
-# ====== Config ======
-API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-# Model bạn đã list ra trong curl: dùng bản pro preview ổn định
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-2.5-pro-preview-03-25")
-# Cho phép CORS từ Cloudflare Pages
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")  # ví dụ: https://raidenx8.pages.dev
+PROVIDER = os.getenv("PROVIDER", "openai").lower()   # "openai" | "gemini"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.0-pro-exp-02-05")
+
+COINGECKO_API = "https://api.coingecko.com/api/v3/simple/price"
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": [FRONTEND_ORIGIN, "*"]}})
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
-GLM_URL = "https://generativelanguage.googleapis.com/v1beta"
+SYSTEM_PROMPT = (
+  "Bạn là RaidenX8 – trả lời ngắn gọn, cụ thể, không vòng vo. "
+  "Nếu không có dữ liệu thời gian thực thì nêu giới hạn và gợi ý cách kiểm tra."
+)
 
-# ====== Helpers ======
-def gemini_generate_content(message, system=None, model=DEFAULT_MODEL, temperature=0.7, top_p=0.95, top_k=40, candidate_count=1):
-    if not API_KEY:
-        return {"error": "Missing GEMINI_API_KEY"}, 500
-
-    url = f"{GLM_URL}/{model}:generateContent?key={API_KEY}"
-
-    # Gemini v1beta schema
-    contents = []
-    if system:
-        contents.append({
-            "role": "user",
-            "parts": [{"text": f"[SYSTEM]\n{system}"}]
-        })
-    contents.append({"role": "user", "parts": [{"text": message}]})
-
+# ---------- Helpers ----------
+def call_openai_chat(text, stream=False):
+    url = "https://api.openai.com/v1/chat/completions"
     payload = {
-        "contents": contents,
-        "generationConfig": {
-            "temperature": temperature,
-            "topP": top_p,
-            "topK": top_k,
-            "candidateCount": candidate_count,
-        }
+        "model": OPENAI_MODEL,
+        "messages": [{"role":"system","content":SYSTEM_PROMPT},
+                     {"role":"user","content":text}],
+        "temperature": 0.7,
+        "stream": bool(stream),
     }
+    r = requests.post(url,
+                      headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
+                               "Content-Type": "application/json"},
+                      json=payload, stream=stream, timeout=90)
+    return r
 
-    try:
-        r = requests.post(url, json=payload, timeout=45)
-        if r.status_code != 200:
-            return {"error": r.text}, r.status_code
-        data = r.json()
-        # Lấy text đầu tiên
-        text = ""
-        try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception:
-            text = ""
-        return {"text": text, "raw": data}, 200
-    except requests.exceptions.RequestException as e:
-        return {"error": str(e)}, 500
+def call_gemini_stream(text):  # SSE (alt=sse)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:streamGenerateContent?alt=sse&key={GEMINI_API_KEY}"
+    payload = {"contents":[{"role":"user","parts":[{"text": text}]}]}
+    r = requests.post(url,
+                      headers={"Content-Type":"application/json"},
+                      json=payload, stream=True, timeout=90)
+    return r
 
+def call_gemini_once(text):    # 1 phát, không stream
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    payload = {"contents":[{"role":"user","parts":[{"text": text}]}]}
+    r = requests.post(url,
+                      headers={"Content-Type":"application/json"},
+                      json=payload, timeout=60)
+    return r
 
-# ====== Routes ======
-@app.route("/health")
+# ---------- Health ----------
+@app.get("/health")
 def health():
-    return jsonify(ok=True, model=DEFAULT_MODEL)
+    return {"ok": True, "provider": PROVIDER,
+            "model": OPENAI_MODEL if PROVIDER=="openai" else GEMINI_MODEL}
 
-@app.route("/ai/chat", methods=["POST"])
-def ai_chat():
-    """
-    Body JSON:
-    { "message": "...", "system": "optional system prompt", "model": "optional" }
-    """
-    data = request.get_json(silent=True) or {}
-    message = (data.get("message") or "").strip()
-    system = (data.get("system") or "Bạn là RaidenX8. Trả lời ngắn gọn, rõ ràng, có ví dụ khi cần.").strip()
-    model = (data.get("model") or DEFAULT_MODEL).strip()
+# ---------- Prices ----------
+@app.get("/prices")
+def prices():
+    ids = request.args.get("ids","bitcoin,ethereum,binancecoin,solana,toncoin,tether")
+    vs  = request.args.get("vs","usd")
+    r = requests.get(COINGECKO_API, params={"ids":ids,"vs_currencies":vs}, timeout=12)
+    return r.json(), r.status_code
 
-    if not message:
-        return jsonify(error="message is required"), 400
+# ---------- AI (HTTP once) ----------
+@app.post("/ai/chat")
+def http_chat():
+    msg = (request.get_json(force=True).get("message") or "").strip()
+    if not msg: return {"error":"Empty message"}, 400
 
-    out, code = gemini_generate_content(message, system=system, model=model)
-    return jsonify(out), code
+    if PROVIDER=="openai":
+        if not OPENAI_API_KEY: return {"error":"Missing OPENAI_API_KEY"}, 400
+        r = call_openai_chat(msg, stream=False)
+        j = r.json()
+        if r.status_code>=400: return j, r.status_code
+        return {"reply": j["choices"][0]["message"]["content"]}
+    else:
+        if not GEMINI_API_KEY: return {"error":"Missing GEMINI_API_KEY"}, 400
+        r = call_gemini_once(msg)
+        j = r.json()
+        if r.status_code>=400: return j, r.status_code
+        parts = j["candidates"][0]["content"]["parts"]
+        txt = "".join(p.get("text","") for p in parts)
+        return {"reply": txt}
 
-# Vì frontend cũ có thể gọi /ai/chat_sync nên map cùng logic
-@app.route("/ai/chat_sync", methods=["POST"])
-def ai_chat_sync():
-    return ai_chat()
+# ---------- AI (SSE stream) ----------
+@app.post("/ai/stream")
+def http_stream():
+    msg = (request.get_json(force=True).get("message") or "").strip()
 
-@app.route("/api/tts", methods=["POST"])
-def api_tts():
-    """
-    Body JSON:
-    { "text": "Xin chào", "lang": "vi" }
-    Trả về file MP3.
-    """
-    data = request.get_json(silent=True) or {}
-    text = (data.get("text") or "").strip()
-    lang = (data.get("lang") or "vi").strip()
+    def gen_openai():
+        with call_openai_chat(msg, stream=True) as resp:
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line: continue
+                yield line + "\n\n"  # đã ở dạng 'data: {...}' / '[DONE]'
 
-    if not text:
-        return jsonify(error="text is required"), 400
+    def gen_gemini():
+        # Gemini SSE: mỗi dòng 'data: {...}' với parts[].text
+        with call_gemini_stream(msg) as resp:
+            for raw in resp.iter_lines(decode_unicode=True):
+                if not raw or not raw.startswith("data: "): continue
+                data = raw[6:]
+                try:
+                    j = json.loads(data)
+                    parts = j.get("candidates",[{}])[0].get("content",{}).get("parts",[])
+                    for p in parts:
+                        t = p.get("text")
+                        if t:
+                            yield "data: " + json.dumps({"choices":[{"delta":{"content": t}}]}) + "\n\n"
+                except Exception:
+                    continue
+            yield "data: [DONE]\n\n"
 
-    try:
-        # Tạo file tạm mp3
-        tmp_dir = tempfile.gettempdir()
-        fname = f"tts-{uuid.uuid4().hex}.mp3"
-        fpath = os.path.join(tmp_dir, fname)
+    if PROVIDER=="openai":
+        return Response(gen_openai(), mimetype="text/event-stream")
+    else:
+        return Response(gen_gemini(), mimetype="text/event-stream")
 
-        tts = gTTS(text=text, lang=lang)
-        tts.save(fpath)
+# ---------- WebSocket 2 chiều ----------
+@socketio.on("connect")
+def on_connect():
+    emit("server_info", {"ok": True, "provider": PROVIDER})
 
-        # Gửi file rồi xóa sau
-        return send_file(fpath, as_attachment=True, download_name="voice.mp3", mimetype="audio/mpeg")
-    except Exception as e:
-        return jsonify(error=f"TTS failed: {e}"), 500
+@socketio.on("user_message")
+def ws_user_message(data):
+    msg = (data.get("message") or "").strip()
+    if not msg: 
+        emit("bot_done", {"reply":"(trống)"}); return
 
-# ====== Main (local) ======
+    if PROVIDER=="openai":
+        if not OPENAI_API_KEY:
+            emit("bot_done", {"reply":"Thiếu OPENAI_API_KEY."}); return
+        try:
+            with call_openai_chat(msg, stream=True) as resp:
+                full=[]
+                for line in resp.iter_lines(decode_unicode=True):
+                    if not line or not line.startswith("data: "): continue
+                    chunk=line[6:]
+                    if chunk=="[DONE]": break
+                    try:
+                        j=json.loads(chunk)
+                        delta=j["choices"][0]["delta"].get("content")
+                        if delta:
+                            full.append(delta); emit("bot_delta",{"delta":delta})
+                    except: pass
+                emit("bot_done", {"reply":"".join(full)})
+        except Exception as e:
+            emit("bot_done", {"reply": f"Lỗi: {e}"})
+    else:
+        if not GEMINI_API_KEY:
+            emit("bot_done", {"reply":"Thiếu GEMINI_API_KEY."}); return
+        try:
+            with call_gemini_stream(msg) as resp:
+                full=[]
+                for raw in resp.iter_lines(decode_unicode=True):
+                    if not raw or not raw.startswith("data: "): continue
+                    try:
+                        j=json.loads(raw[6:])
+                        parts=j.get("candidates",[{}])[0].get("content",{}).get("parts",[])
+                        for p in parts:
+                            t=p.get("text")
+                            if t:
+                                full.append(t); emit("bot_delta",{"delta":t})
+                    except: pass
+                emit("bot_done", {"reply":"".join(full)})
+        except Exception as e:
+            emit("bot_done", {"reply": f"Lỗi: {e}"})
+
+# ---------- TTS (OpenAI) ----------
+@app.post("/api/tts")
+def tts():
+    # Gemini chưa có TTS trong API public; giữ TTS bằng OpenAI (hoặc dùng Web Speech ở frontend)
+    if not OPENAI_API_KEY:
+        return {"error":"TTS yêu cầu OPENAI_API_KEY (gpt-4o-mini-tts)."}, 400
+    text = (request.get_json(force=True).get("text") or "").strip()
+    voice = request.json.get("voice","alloy")
+    url = "https://api.openai.com/v1/audio/speech"
+    payload={"model":"gpt-4o-mini-tts","voice":voice,"input":text,"format":"mp3"}
+    r=requests.post(url, headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
+                                  "Content-Type":"application/json"},
+                    json=payload, timeout=120)
+    if r.status_code>=400: return r.json(), r.status_code
+    fn=f"tts_{int(time.time())}.mp3"
+    return Response(r.content, mimetype="audio/mpeg",
+                    headers={"Content-Disposition": f'inline; filename="{fn}"'})
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    socketio.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 7860)))
