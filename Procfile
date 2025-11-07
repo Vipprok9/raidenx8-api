@@ -1,1 +1,1 @@
-web: gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 -b 0.0.0.0:$PORT server:app
+web: gunicorn -w 1 -k gthread --threads 8 -b 0.0.0.0:$PORT server:app
