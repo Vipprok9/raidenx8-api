@@ -1,0 +1,21 @@
+services:
+- type: web
+  name: raidenx8-api
+  env: python
+  buildCommand: pip install -r requirements.txt
+  startCommand: gunicorn -k eventlet -w 1 -b 0.0.0.0:$PORT server:app
+  envVars:
+  - key: GEMINI_API_KEY
+    sync: false
+  - key: GEMINI_MODEL
+    value: gemini-1.5-pro
+  - key: OPENAI_API_KEY
+    sync: false
+  - key: GOOGLE_TTS_JSON
+    sync: false
+  - key: TELEGRAM_BOT_TOKEN
+    sync: false
+  - key: TELEGRAM_CHAT_ID
+    sync: false
+  - key: TELEGRAM_SECRET
+    value: RAIDENX_SECRET_123
