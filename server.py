@@ -1,3 +1,5 @@
+# server.py — RaidenX8 (Google AI Studio v1beta + Gemini 1.5 Flash)
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os, requests
@@ -5,52 +7,45 @@ import os, requests
 app = Flask(__name__)
 CORS(app)
 
-# === ENV VAR ===
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-1.5-flash"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")   # key từ studio.google.com
+MODEL = "gemini-1.5-flash"                     # miễn phí, nhanh
+BASE_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={GEMINI_API_KEY}"
 
-# === ROUTES ===
-@app.route("/")
-def home():
+@app.get("/")
+def root():
     return "RaidenX8 API online ✅", 200
 
-@app.route("/health")
+@app.get("/health")
 def health():
     return jsonify({"status": "ok"}), 200
 
-@app.route("/ai/chat", methods=["POST"])
+@app.post("/ai/chat")
 def ai_chat():
     try:
-        data = request.get_json(force=True)
-        message = data.get("message", "")
-        if not message:
+        data = request.get_json(force=True) or {}
+        msg = (data.get("message") or "").strip()
+        if not msg:
             return jsonify({"reply": "Thiếu nội dung"}), 400
 
-        # Gửi request đến Google Gemini API
         payload = {
             "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": message}]
-                }
+                {"role": "user", "parts": [{"text": msg}]}
             ]
         }
-        r = requests.post(GEMINI_URL, json=payload, timeout=25)
-        result = r.json()
+        r = requests.post(BASE_URL, json=payload, timeout=25)
+        res = r.json()
 
-        # Parse phản hồi
-        if "candidates" in result:
-            reply = result["candidates"][0]["content"]["parts"][0]["text"]
+        if r.ok and "candidates" in res and res["candidates"]:
+            parts = res["candidates"][0].get("content", {}).get("parts", [])
+            text = parts[0].get("text", "") if parts else ""
+            return jsonify({"reply": text or "[empty]"})
         else:
-            reply = f"Lỗi Gemini: {result}"
-
-        return jsonify({"reply": reply})
+            # Trả nguyên lỗi để debug phía FE
+            return jsonify({"reply": f"Lỗi Gemini: {res}"}), 502
 
     except Exception as e:
         return jsonify({"reply": f"Lỗi server: {e}"}), 500
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
