@@ -2,6 +2,7 @@ flask
 flask-cors
 flask-socketio
 eventlet
+gunicorn
 google-generativeai
-requests
 google-cloud-texttospeech
+requests
