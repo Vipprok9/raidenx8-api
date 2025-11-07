@@ -4,63 +4,56 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 
+# Flask init
 app = Flask(__name__)
 CORS(app)
-
-# Socket.IO (gevent worker trên Render)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+# Load Gemini key
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
-# ===== Health & Root =====
 @app.get("/health")
 def health():
     return jsonify(status="ok")
 
 @app.get("/")
-def root():
-    return jsonify(app="RaidenX8 API", ok=True)
+def home():
+    return jsonify(app="RaidenX8 Backend", model=GEMINI_MODEL, ready=bool(GEMINI_KEY))
 
-# ===== Chat AI (Gemini -> fallback echo) =====
 @app.post("/ai/chat")
 def ai_chat():
+    """Chat 2 chiều (AI hoặc echo fallback)."""
     data = request.get_json(silent=True) or {}
     user_msg = (data.get("message") or "").strip()
     if not user_msg:
-        return jsonify(reply="Bạn thử gõ gì đó trước nhé 😄")
+        return jsonify(reply="Xin chào! Bạn muốn hỏi gì nè?")
 
-    # Nếu chưa có key => echo
-    if not GEMINI_API_KEY:
+    # Nếu chưa có key → echo
+    if not GEMINI_KEY:
         return jsonify(reply=f"[echo] {user_msg}")
 
-    # Gọi Gemini 1.5 Flash (Google AI Studio)
+    # Gọi Gemini API (Google AI Studio)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
+    payload = {"contents": [{"parts": [{"text": user_msg}]}]}
     try:
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
-        payload = {
-            "contents": [{
-                "parts": [{"text": f"Trả lời ngắn gọn bằng tiếng Việt: {user_msg}"}]
-            }]
-        }
-        r = requests.post(f"{url}?key={GEMINI_API_KEY}", json=payload, timeout=20)
+        r = requests.post(url, json=payload, timeout=20)
         r.raise_for_status()
         js = r.json()
-        text = js.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-        if not text:
-            text = "Xin lỗi, mình chưa nhận được câu trả lời hợp lệ."
-        return jsonify(reply=text)
+        reply = js["candidates"][0]["content"]["parts"][0]["text"]
+        return jsonify(reply=reply.strip())
     except Exception as e:
-        return jsonify(reply=f"Lỗi gọi Gemini: {e}")
+        return jsonify(reply=f"(Gemini lỗi hoặc quota hết) {str(e)[:120]}")
 
-# ===== Socket.IO demo (có thể phát sự kiện nếu muốn) =====
+# === Socket realtime ===
 @socketio.on("connect")
-def on_connect():
-    emit("server_message", {"msg": "✅ Server Socket.IO đã kết nối."})
+def handle_connect():
+    emit("server_message", {"msg": "🔗 Đã kết nối Socket.IO"})
 
 @socketio.on("client_message")
-def on_client_message(data):
-    # broadcast cho mọi client
-    emit("server_message", {"msg": data.get("msg", "")}, broadcast=True)
+def handle_client_message(data):
+    msg = data.get("msg", "")
+    emit("server_message", {"msg": f"Echo: {msg}"}, broadcast=True)
 
-# ===== Local dev =====
 if __name__ == "__main__":
-    socketio.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    socketio.run(app, host="0.0.0.0", port=10000)
