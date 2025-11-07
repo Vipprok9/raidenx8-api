@@ -1,85 +1,118 @@
 import os
+import time
+import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from flask_socketio import SocketIO, emit
-import requests
 
+# =========================
+# App & Config
+# =========================
 app = Flask(__name__)
-CORS(app)
-
-# Socket.IO (gevent worker)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-def call_gemini(prompt: str) -> str:
-    """
-    Gọi Gemini 1.5 Flash qua REST API.
-    Nếu thiếu key hoặc lỗi quota → raise Exception để fallback echo.
-    """
+# Gemini endpoints (Google AI Studio)
+GEMINI_CHAT_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
+)
+
+# Optional: simple healthcheck
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "ts": int(time.time())})
+
+# =========================
+# Helpers
+# =========================
+def call_gemini(message: str) -> str:
     if not GEMINI_API_KEY:
-        raise RuntimeError("Missing GEMINI_API_KEY")
+        raise RuntimeError("Thiếu GEMINI_API_KEY")
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/"
-        "models/gemini-1.5-flash-latest:generateContent"
-    )
     payload = {
         "contents": [
-            {"parts": [{"text": prompt}]}
-        ],
-        "generationConfig": {
-            "temperature": 0.7,
-            "maxOutputTokens": 256
-        }
+            {
+                "parts": [
+                    {"text": message}
+                ]
+            }
+        ]
     }
-    params = {"key": GEMINI_API_KEY}
-    r = requests.post(url, json=payload, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    resp = requests.post(
+        f"{GEMINI_CHAT_URL}?key={GEMINI_API_KEY}",
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
 
-    # Rút text an toàn
-    try:
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception:
-        raise RuntimeError(f"Gemini bad response: {data}")
+    # lấy text an toàn
+    candidates = data.get("candidates", [])
+    if not candidates:
+        raise RuntimeError("Gemini không trả về candidates")
 
-@app.get("/health")
-def health():
-    return jsonify(status="ok")
+    content = candidates[0].get("content", {})
+    parts = content.get("parts", [])
+    if not parts or "text" not in parts[0]:
+        raise RuntimeError("Gemini không có phần text")
 
-@app.get("/")
-def root():
-    return jsonify(app="RaidenX8 API", ok=True)
+    return parts[0]["text"].strip()
 
-@app.post("/ai/chat")
+
+def call_openai(message: str) -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Thiếu OPENAI_API_KEY")
+
+    # dùng Chat Completions (gpt-4o-mini/gpt-4o, tuỳ bạn)
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": "Bạn là trợ lý hữu ích, trả lời ngắn gọn."},
+            {"role": "user", "content": message},
+        ],
+        "temperature": 0.7,
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"].strip()
+
+# =========================
+# Main API
+# =========================
+@app.route("/ai/chat", methods=["POST"])
 def ai_chat():
+    """
+    Frontend sẽ gọi POST /ai/chat với JSON:
+    {"message": "..."}
+    Trả về: {"reply": "..."}
+    """
     data = request.get_json(silent=True) or {}
-    user_msg = (data.get("message") or "").strip()
-    if not user_msg:
-        return jsonify(reply="Bạn chưa nhập nội dung."), 400
+    message = (data.get("message") or "").strip()
 
-    # Thử Gemini → nếu lỗi thì echo
+    if not message:
+        return jsonify({"reply": "Bạn chưa nhập nội dung."}), 400
+
     try:
-        reply = call_gemini(user_msg)
-    except Exception as e:
-        # Không gọi lặp lại hay tự phát sự kiện nữa để tránh đệ quy
-        reply = f"[echo] {user_msg}  (AI lỗi: {str(e)[:80]})"
+        # Ưu tiên Gemini
+        reply = call_gemini(message)
+        return jsonify({"reply": reply})
+    except Exception as g_err:
+        # Fallback OpenAI (nếu có)
+        try:
+            if OPENAI_API_KEY:
+                reply = call_openai(message)
+                return jsonify({"reply": reply, "provider": "openai-fallback"})
+            # Nếu không có fallback
+            return jsonify({"reply": f"AI lỗi (Gemini): {g_err}"}), 500
+        except Exception as o_err:
+            return jsonify({"reply": f"AI lỗi (Gemini & OpenAI): {o_err}"}), 500
 
-    return jsonify(reply=reply)
 
-# ===== Socket.IO (demo 2 chiều) =====
-@socketio.on("connect")
-def on_connect():
-    emit("server_message", {"msg": "🔌 Socket.IO connected."})
-
-@socketio.on("client_message")
-def on_client_message(data):
-    # Chỉ broadcast 1 lần, không tự gửi ngược lại client_message để tránh vòng lặp
-    txt = (data or {}).get("msg", "")
-    emit("server_message", {"msg": f"[echo] {txt}"}, broadcast=True)
-
-# ===== Local dev =====
+# =========== run local ===========
 if __name__ == "__main__":
-    # Chạy thử local: python server.py
-    socketio.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    # Chạy dev local: python server.py
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
