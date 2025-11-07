@@ -1,7 +1,8 @@
-flask
-flask-cors
-flask-socketio
-gevent
-gevent-websocket
-gunicorn
-requests
+flask==3.0.2
+flask-cors==4.0.0
+flask-socketio==5.3.6
+gevent==23.9.1
+gevent-websocket==0.10.1
+gunicorn==23.0.0
+requests==2.32.3
+python-socketio==5.12.0
