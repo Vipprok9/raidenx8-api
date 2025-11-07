@@ -1,51 +1,82 @@
-# server.py — RaidenX8 (Google AI Studio v1beta + Gemini 1.5 Flash)
-
+import os, json, time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import os, requests
+import requests
+from requests.adapters import HTTPAdapter, Retry
 
 app = Flask(__name__)
 CORS(app)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")   # key từ studio.google.com
-MODEL = "gemini-1.5-flash"                     # miễn phí, nhanh
-BASE_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={GEMINI_API_KEY}"
+# ====== Config ======
+API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+# Dùng đúng endpoint v1beta + model alias -latest
+MODEL_ID = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest")
+BASE_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_ID}:generateContent"
 
-@app.get("/")
-def root():
-    return "RaidenX8 API online ✅", 200
+# Tạo session có retry để đỡ 502/429
+session = requests.Session()
+retries = Retry(
+    total=4,
+    backoff_factor=0.6,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["POST", "GET"],
+)
+adapter = HTTPAdapter(max_retries=retries)
+session.mount("http://", adapter)
+session.mount("https://", adapter)
+TIMEOUT = (5, 20)  # (connect, read)
 
-@app.get("/health")
+def gemini_generate(text):
+    if not API_KEY:
+        return None, "Thiếu GEMINI_API_KEY trên Render"
+
+    url = f"{BASE_URL}?key={API_KEY}"
+    payload = {
+        "contents": [
+            {
+                "parts": [{"text": text}]
+            }
+        ]
+    }
+    headers = {"Content-Type": "application/json"}
+    r = session.post(url, headers=headers, data=json.dumps(payload), timeout=TIMEOUT)
+    if r.status_code != 200:
+        try:
+            err = r.json()
+        except Exception:
+            err = {"error": {"code": r.status_code, "message": r.text[:200]}}
+        # Trả lỗi gọn để frontend hiện đúng
+        return None, f"Gemini lỗi {err.get('error', {}).get('code')}: {err.get('error', {}).get('message')}"
+    data = r.json()
+    # Parse text (v1beta)
+    try:
+        candidates = data["candidates"]
+        parts = candidates[0]["content"]["parts"]
+        text_out = "".join(p.get("text", "") for p in parts)
+        return text_out.strip(), None
+    except Exception as e:
+        return None, f"Lỗi parse response: {e}"
+
+@app.route("/health")
 def health():
-    return jsonify({"status": "ok"}), 200
+    return {"ok": True, "model": MODEL_ID}, 200
 
-@app.post("/ai/chat")
+@app.route("/ai/chat", methods=["POST"])
 def ai_chat():
     try:
-        data = request.get_json(force=True) or {}
-        msg = (data.get("message") or "").strip()
-        if not msg:
-            return jsonify({"reply": "Thiếu nội dung"}), 400
+        body = request.get_json(force=True, silent=True) or {}
+        text = (body.get("message") or "").strip()
+        if not text:
+            return jsonify({"error": "Thiếu 'message'"}), 400
 
-        payload = {
-            "contents": [
-                {"role": "user", "parts": [{"text": msg}]}
-            ]
-        }
-        r = requests.post(BASE_URL, json=payload, timeout=25)
-        res = r.json()
-
-        if r.ok and "candidates" in res and res["candidates"]:
-            parts = res["candidates"][0].get("content", {}).get("parts", [])
-            text = parts[0].get("text", "") if parts else ""
-            return jsonify({"reply": text or "[empty]"})
-        else:
-            # Trả nguyên lỗi để debug phía FE
-            return jsonify({"reply": f"Lỗi Gemini: {res}"}), 502
-
+        # Gọi Gemini qua proxy này
+        reply, err = gemini_generate(text)
+        if err:
+            return jsonify({"error": err}), 502
+        return jsonify({"reply": reply})
     except Exception as e:
-        return jsonify({"reply": f"Lỗi server: {e}"}), 500
-
+        return jsonify({"error": f"Server exception: {e}"}), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    # Local run: python server.py
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
