@@ -1,102 +1,82 @@
-# server.py — RaidenX8 API v6.6 (Socket.IO + Gemini + Telegram + Optional TTS)
-# Start: gunicorn -k eventlet -w 1 -b 0.0.0.0:$PORT server:app
-import os, base64, requests, json
+# --- PHẢI ĐỂ TRÊN CÙNG ---
+import eventlet
+eventlet.monkey_patch()
+
+import os, json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 import google.generativeai as genai
 
+# ====== ENV ======
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")          # optional for TTS
-GOOGLE_TTS_JSON = os.getenv("GOOGLE_TTS_JSON")        # optional service account JSON (base64 or plain)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-TELEGRAM_SECRET = os.getenv("TELEGRAM_SECRET", "RAIDENX_SECRET_123")
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")      # optional
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")        # optional
+TELEGRAM_SECRET    = os.getenv("TELEGRAM_SECRET", "RAIDENX_SECRET_123")
 
+# ====== APP ======
 app = Flask(__name__)
+# nếu muốn chặt hơn: CORS(app, origins=["https://raidenx8.pages.dev"])
 CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet",
+                    ping_interval=25, ping_timeout=60)
 
-# Gemini
+# ====== Gemini (Google AI Studio) ======
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel(GEMINI_MODEL)
 
-@app.get("/health")
-def health(): return "ok", 200
+@app.get("/")
+def root():
+    return "ok", 200
 
-@socketio.on("connect")
-def on_connect(): emit("chat", "RaidenX8 đã kết nối. Hỏi mình bất cứ điều gì!")
+@app.get("/health")
+def health():
+    return "ok", 200
 
 def ai_reply(user_text: str) -> str:
-    prompt = f"Bạn là Avatar AI của RaidenX8. Trả lời ngắn gọn, thân thiện, tiếng Việt. User: {user_text}"
+    """Gọi Gemini trả lời ngắn gọn, thân thiện (tiếng Việt)."""
     try:
+        prompt = (
+            "Bạn là Avatar AI của RaidenX8. Trả lời ngắn gọn, thân thiện, rõ ràng.\n"
+            f"Người dùng: {user_text}"
+        )
         r = model.generate_content(prompt)
-        return (r.text or '').strip() or "Mình đang suy nghĩ…"
+        return (getattr(r, "text", "") or "").strip()
     except Exception as e:
         return f"Lỗi tạm thời: {e}"
 
+# ====== Socket.IO ======
+@socketio.on("connect")
+def on_connect():
+    emit("chat", "RaidenX8 đã kết nối. Gõ gì đó đi!")
+
 @socketio.on("chat")
 def on_chat(msg):
-    reply = ai_reply(str(msg))
-    emit("chat", reply)
+    emit("chat", ai_reply(str(msg)))
 
-# ------- Optional TTS endpoint (auto-detect provider) -------
+# HTTP fallback cho frontend
+@app.post("/ai/chat")
+def http_chat():
+    data = request.get_json(silent=True) or {}
+    return jsonify({"reply": ai_reply(str(data.get("text", "")))})
+
+# ====== TTS endpoint (Chrome Web Speech) ======
+# Trả về 'webspeech' để frontend dùng speechSynthesis của Chrome đọc.
 @app.post("/tts")
 def tts():
-    data = request.get_json(force=True)
-    text = (data.get("text") or "")[:1000]
-    lang = (data.get("voice") or "vi-VN")
-    # Try OpenAI first if available
-    if OPENAI_API_KEY:
-        try:
-            # Use OpenAI TTS (voice alloy)
-            url = "https://api.openai.com/v1/audio/speech"
-            headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-            payload = {"model": "gpt-4o-mini-tts", "voice": "alloy", "input": text}
-            r = requests.post(url, headers=headers, json=payload)
-            r.raise_for_status()
-            audio_b = base64.b64encode(r.content).decode("ascii")
-            return jsonify({"provider":"openai","audio_base64":audio_b})
-        except Exception as e:
-            pass
-    # Try Google Cloud TTS if creds provided
-    if GOOGLE_TTS_JSON:
-        try:
-            # write credentials to tmp file
-            try:
-                content = base64.b64decode(GOOGLE_TTS_JSON).decode("utf-8")
-            except Exception:
-                content = GOOGLE_TTS_JSON
-            cred_path = "/tmp/google_tts.json"
-            with open(cred_path, "w") as f: f.write(content)
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
-            from google.cloud import texttospeech
-            client = texttospeech.TextToSpeechClient()
-            synthesis_input = texttospeech.SynthesisInput(text=text)
-            voice = texttospeech.VoiceSelectionParams(language_code="vi-VN", name="vi-VN-Neural2-C")
-            audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
-            response = client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
-            audio_b = base64.b64encode(response.audio_content).decode("ascii")
-            return jsonify({"provider":"google","audio_base64":audio_b})
-        except Exception as e:
-            pass
-    return jsonify({"provider":"webspeech","audio_base64":None}), 200
+    data = request.get_json(force=True) or {}
+    text = (data.get("text") or "")[:500]
+    return jsonify({"provider": "webspeech", "text": text})
 
-# Telegram webhook (optional)
+# ====== Telegram webhook (tùy chọn) ======
 @app.post("/webhook")
 def telegram_webhook():
-    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_SECRET:
+    if request.headers.get("X-Telegram-Secret-Token") != TELEGRAM_SECRET:
         return "forbidden", 403
-    update = request.get_json(silent=True) or {}
-    msg = update.get("message") or {}
-    if msg.get("text"):
-        chat_id = str(msg["chat"]["id"])
-        text = msg["text"]
-        reply = ai_reply(text)
-        if TELEGRAM_BOT_TOKEN:
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                          json={"chat_id": chat_id, "text": reply})
-        socketio.emit("chat", f"Telegram: {text}")
-        socketio.emit("chat", f"AI: {reply}")
-    return jsonify({"ok": True})
+    # Tự xử lý nếu cần
+    return jsonify(ok=True)
+
+# Local run (Render sẽ chạy bằng gunicorn)
+if __name__ == "__main__":
+    socketio.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
