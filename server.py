@@ -1,104 +1,121 @@
-import os, json, requests
-from flask import Flask, request, jsonify
+import os
+import uuid
+import tempfile
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import requests
+from gtts import gTTS
+
+# ====== Config ======
+API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+# Model bạn đã list ra trong curl: dùng bản pro preview ổn định
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-2.5-pro-preview-03-25")
+# Cho phép CORS từ Cloudflare Pages
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")  # ví dụ: https://raidenx8.pages.dev
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": [FRONTEND_ORIGIN, "*"]}})
 
-# ==== Cấu hình ====
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-MODEL_FAST = os.getenv("GEMINI_MODEL_FAST", "models/gemini-2.5-flash")
-MODEL_SMART = os.getenv("GEMINI_MODEL_SMART", "models/gemini-2.5-pro")
-GEN_BASE = "https://generativelanguage.googleapis.com/v1beta"
+GLM_URL = "https://generativelanguage.googleapis.com/v1beta"
 
-# ==== Session tối ưu tốc độ ====
-session = requests.Session()
-retries = Retry(total=1, backoff_factor=0.2, status_forcelist=[429, 500, 502, 503, 504])
-session.mount("https://", HTTPAdapter(max_retries=retries, pool_connections=50, pool_maxsize=50))
-session.headers.update({"Connection": "keep-alive"})
+# ====== Helpers ======
+def gemini_generate_content(message, system=None, model=DEFAULT_MODEL, temperature=0.7, top_p=0.95, top_k=40, candidate_count=1):
+    if not API_KEY:
+        return {"error": "Missing GEMINI_API_KEY"}, 500
 
-# ==== Prompt & Few-shot (giảm “chung chung”) ====
-SYS_PROMPT = (
-  "Bạn là RaidenX8 – AI Gen-Z, phản hồi NGẮN, THẲNG, CỤ THỂ.\n"
-  "• Mở đầu = 1 câu kết luận rõ ràng.\n"
-  "• Sau đó 3–5 bullet: số liệu, ví dụ, bước hành động.\n"
-  "• Nếu có dữ liệu server (weather/price) → dùng ngay; KHÔNG nói 'hãy lên Google'.\n"
-  "• Không dùng ký tự ** hoặc *; không nói 'với tư cách là AI'.\n"
-  "• Nếu chưa chắc: nêu giả định + bước kiểm chứng ngắn.\n"
-  "Giữ văn phong tự nhiên, dễ hiểu."
-)
+    url = f"{GLM_URL}/{model}:generateContent?key={API_KEY}"
 
-FEWSHOT = [
-  {"role":"user","parts":[{"text":"Tối ưu SEO trang NFT?"}]},
-  {"role":"model","parts":[{"text":"Tập trung tốc độ + từ khóa NFT.\n- LCP <2.5s, CLS <0.1\n- <title>/<meta> chứa NFT, Solana\n- Schema Product JSON-LD\n- Hình WebP + lazy load"}]},
-  {"role":"user","parts":[{"text":"Cách tăng tương tác cộng đồng Web3?"}]},
-  {"role":"model","parts":[{"text":"Tạo minigame + phần thưởng rõ ràng.\n- AMA hàng tuần + giveaway\n- Leaderboard token\n- Social quest (Zealy)\n- Thu thập feedback → airdrop nhỏ"}]},
-]
+    # Gemini v1beta schema
+    contents = []
+    if system:
+        contents.append({
+            "role": "user",
+            "parts": [{"text": f"[SYSTEM]\n{system}"}]
+        })
+    contents.append({"role": "user", "parts": [{"text": message}]})
 
-BAD_PHRASES = [
-  "as an ai", "với tư cách là", "hãy tìm trên google",
-  "tôi không thể truy cập", "i cannot access", "as a language model"
-]
-
-def _clean(text: str) -> str:
-    if not text: return ""
-    for s in BAD_PHRASES: text = text.replace(s, "")
-    text = text.replace("*", "").strip()
-    return "\n".join([ln.strip() for ln in text.splitlines() if ln.strip()])
-
-def _is_generic(t: str) -> bool:
-    if not t: return True
-    low = t.lower()
-    generic = ["tùy trường hợp", "hãy tìm hiểu thêm", "không thể cung cấp", "có thể cân nhắc"]
-    return any(k in low for k in generic) or len(t.split()) < 25
-
-def _choose_model(q: str) -> str:
-    if len(q) > 140 or any(k in q.lower() for k in ["tại sao","phân tích","so sánh","thuật toán","design","vì sao"]):
-        return MODEL_SMART
-    return MODEL_FAST
-
-def gemini_call(question: str, retry: bool = True) -> str:
-    model = _choose_model(question)
-    url = f"{GEN_BASE}/{model}:generateContent?key={GEMINI_API_KEY}"
-    contents = [{"role":"user","parts":[{"text": SYS_PROMPT}]}, *FEWSHOT,
-                {"role":"user","parts":[{"text": question}]}]
     payload = {
         "contents": contents,
-        "generationConfig": {"temperature": 0.45, "topK": 40, "topP": 0.9, "maxOutputTokens": 384}
+        "generationConfig": {
+            "temperature": temperature,
+            "topP": top_p,
+            "topK": top_k,
+            "candidateCount": candidate_count,
+        }
     }
+
     try:
-        r = session.post(url, json=payload, timeout=(3.5, 8))
-        if not r.ok:
-            return "Mạng hơi chậm, thử lại giúp mình nhé."
-        t = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception:
-        return "Hơi kẹt, thử lại giúp mình nhé."
-
-    t = _clean(t)
-
-    # Nếu còn chung chung → reprompt 1 lần yêu cầu cụ thể hóa
-    if retry and _is_generic(t):
-        payload["contents"].append({"role":"user","parts":[{"text":"Cụ thể hơn: thêm số/bước/ví dụ, 3–5 bullet, ngắn gọn."}]})
+        r = requests.post(url, json=payload, timeout=45)
+        if r.status_code != 200:
+            return {"error": r.text}, r.status_code
+        data = r.json()
+        # Lấy text đầu tiên
+        text = ""
         try:
-            r2 = session.post(url, json=payload, timeout=(3.5, 8))
-            if r2.ok:
-                t2 = _clean(r2.json()["candidates"][0]["content"]["parts"][0]["text"])
-                if not _is_generic(t2):
-                    return t2
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
         except Exception:
-            pass
-    return t
+            text = ""
+        return {"text": text, "raw": data}, 200
+    except requests.exceptions.RequestException as e:
+        return {"error": str(e)}, 500
 
-@app.post("/ai/chat_sync")
-def chat_sync():
-    data = request.get_json(force=True)
-    q = (data.get("message") or "").strip()
-    if not q:
-        return jsonify({"error": "missing message"}), 400
-    return jsonify({"reply": gemini_call(q)})
 
-@app.get("/health")
+# ====== Routes ======
+@app.route("/health")
 def health():
-    return jsonify({"ok": True, "model_fast": MODEL_FAST, "model_smart": MODEL_SMART})
+    return jsonify(ok=True, model=DEFAULT_MODEL)
+
+@app.route("/ai/chat", methods=["POST"])
+def ai_chat():
+    """
+    Body JSON:
+    { "message": "...", "system": "optional system prompt", "model": "optional" }
+    """
+    data = request.get_json(silent=True) or {}
+    message = (data.get("message") or "").strip()
+    system = (data.get("system") or "Bạn là RaidenX8. Trả lời ngắn gọn, rõ ràng, có ví dụ khi cần.").strip()
+    model = (data.get("model") or DEFAULT_MODEL).strip()
+
+    if not message:
+        return jsonify(error="message is required"), 400
+
+    out, code = gemini_generate_content(message, system=system, model=model)
+    return jsonify(out), code
+
+# Vì frontend cũ có thể gọi /ai/chat_sync nên map cùng logic
+@app.route("/ai/chat_sync", methods=["POST"])
+def ai_chat_sync():
+    return ai_chat()
+
+@app.route("/api/tts", methods=["POST"])
+def api_tts():
+    """
+    Body JSON:
+    { "text": "Xin chào", "lang": "vi" }
+    Trả về file MP3.
+    """
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    lang = (data.get("lang") or "vi").strip()
+
+    if not text:
+        return jsonify(error="text is required"), 400
+
+    try:
+        # Tạo file tạm mp3
+        tmp_dir = tempfile.gettempdir()
+        fname = f"tts-{uuid.uuid4().hex}.mp3"
+        fpath = os.path.join(tmp_dir, fname)
+
+        tts = gTTS(text=text, lang=lang)
+        tts.save(fpath)
+
+        # Gửi file rồi xóa sau
+        return send_file(fpath, as_attachment=True, download_name="voice.mp3", mimetype="audio/mpeg")
+    except Exception as e:
+        return jsonify(error=f"TTS failed: {e}"), 500
+
+# ====== Main (local) ======
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
