@@ -2,12 +2,10 @@ services:
   - type: web
     name: raidenx8-api
     env: python
-    region: oregon
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn --worker-class eventlet -w 1 -b 0.0.0.0:$PORT server:app
     envVars:
-      - key: GEMINI_API_KEY
-        sync: false
-      - key: SECRET_KEY
-        generateValue: true
-    autoDeploy: true
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"
+      - key: PYTHONUNBUFFERED
+        value: "1"
