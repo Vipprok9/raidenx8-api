@@ -4,4 +4,4 @@ flask-socketio
 eventlet
 requests
 gunicorn
-gTTS==2.6.0
+gTTS==2.5.3
