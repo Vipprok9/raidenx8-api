@@ -5,3 +5,4 @@ eventlet==0.40.3
 google-generativeai==0.7.2
 openai==1.52.2
 requests>=2.32.0
+gunicorn==21.2.0
