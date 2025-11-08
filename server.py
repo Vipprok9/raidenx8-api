@@ -1,112 +1,82 @@
-# server.py  – RaidenX8 API (Flask + Socket.IO)
-# Safe for Render free tier. Async mode = threading (không cần eventlet).
+
 import os
-import time
+import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
+import requests
 
-# --- Optional Gemini ---
-MODEL = "gemini-2.5-flash-preview-05-20"
-GEMINI_OK = False
-genai = None
-if os.getenv("GEMINI_API_KEY"):
-    try:
-        import google.generativeai as genai  # type: ignore
-        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        GEMINI_OK = True
-    except Exception:
-        genai = None
-        GEMINI_OK = False
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-preview-05-20")
 
 app = Flask(__name__)
-CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+CORS(app, resources={r"/*": {"origins": "*"}})
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
-# ----------------- Utils -----------------
-def rule_based_reply(text: str) -> str:
-    t = (text or "").lower().strip()
-    if not t:
-        return "Bạn muốn hỏi gì nè? Ví dụ: 'Thời tiết Huế hôm nay' hoặc 'Giá BTC bây giờ'."
+def simple_rules(user_text: str) -> str:
+    t = user_text.lower()
+    if "giá btc" in t or "btc" in t:
+        try:
+            r = requests.get("https://api.coingecko.com/api/v3/simple/price", params={"ids":"bitcoin","vs_currencies":"usd"} , timeout=8)
+            data = r.json()
+            usd = data.get("bitcoin",{}).get("usd")
+            if usd:
+                return f"BTC hiện tại ≈ ${usd:,}."
+        except Exception as e:
+            return f"Lỗi lấy giá BTC: {e}"
+        return "Chưa đọc được giá BTC."
+    if "thời tiết" in t:
+        return "Demo thời tiết: Huế có mây nhẹ, 27–30°C."
+    if "bật đọc truyện" in t:
+        return "Đã bật chế độ đọc truyện demo (giọng: vi_VN)."
+    return ""
 
-    if "btc" in t or "bitcoin" in t:
-        return "Giá BTC (demo): bản miễn phí chưa gọi API thị trường. Khi có khoá thật mình sẽ trả realtime nhé."
-
-    if "thời tiết" in t or "weather" in t:
-        return "Thời tiết (demo): backend chưa bật nguồn dữ liệu công cộng. Đây là bản minh hoạ để test luồng WebSocket/REST."
-
-    if "đọc truyện" in t or "narrate" in t:
-        return "Narrate (demo): RaidenX8 mở mắt giữa dải sáng Aurora Pulse, giai điệu chill khẽ ngân..."
-
-    return "Mình đã nhận tin nhắn. Đây là phản hồi demo (fallback). Hãy hỏi thời tiết, giá BTC, hoặc bật đọc truyện nhé."
-
-def call_gemini(prompt: str) -> str:
-    if not GEMINI_OK or genai is None:
-        return rule_based_reply(prompt)
-
+def gemini_answer(prompt: str) -> str:
+    if not GEMINI_KEY:
+        return "Lỗi Gemini: thiếu GEMINI_API_KEY."
     try:
-        sys_inst = (
-            "Bạn là trợ lý Việt hoá, trả lời ngắn gọn, thân thiện.\n"
-            "Nếu không có số liệu realtime, nói rõ đây là demo.\n"
-        )
-        model = genai.GenerativeModel(MODEL, system_instruction=sys_inst)
-        resp = model.generate_content(prompt or "Xin chào!")
-        # Một số SDK trả về .text, một số trả về candidates
-        if hasattr(resp, "text") and resp.text:
-            return resp.text.strip()
-        if hasattr(resp, "candidates") and resp.candidates:
-            parts = resp.candidates[0].content.parts
-            texts = [getattr(p, "text", "") for p in parts]
-            return "\n".join([s for s in texts if s]).strip() or rule_based_reply(prompt)
-        return rule_based_reply(prompt)
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_KEY)
+        model = genai.GenerativeModel(MODEL_NAME)
+        resp = model.generate_content(prompt)
+        text = getattr(resp, "text", None) or (resp.candidates[0].content.parts[0].text if getattr(resp,"candidates",None) else "")
+        return text.strip() if text else "Xin lỗi, Gemini không trả về nội dung."
     except Exception as e:
-        # Không để văng lỗi, luôn trả lời có nghĩa
-        return f"Lỗi Gemini (demo trả lời): {e}. Mình sẽ dùng phản hồi mặc định.\n" + rule_based_reply(prompt)
+        return f"Lỗi gọi Gemini: {e}"
 
-def ai_reply(text: str) -> str:
-    # Ưu tiên quy tắc nhỏ cho nhanh, còn lại để Gemini
-    base = rule_based_reply(text)
-    if base.startswith("Mình đã nhận") and GEMINI_OK:
-        return call_gemini(text)
-    # Nếu rule đã match thì trả rule; nếu có GEMINI thì vẫn có thể gọi khi người dùng muốn nội dung mở
-    if GEMINI_OK and ("?" in (text or "") or "giải thích" in (text or "").lower()):
-        return call_gemini(text)
-    return base
+def answer(user_text: str) -> str:
+    rule = simple_rules(user_text)
+    if rule:
+        return rule
+    return gemini_answer(user_text)
 
-# ----------------- HTTP endpoints -----------------
-@app.get("/health")
+@app.route("/health")
 def health():
-    return jsonify({
-        "ok": True,
-        "provider": "gemini" if GEMINI_OK else "offline",
-        "model": MODEL if GEMINI_OK else "rule-based",
-        "time": int(time.time())
-    })
+    return jsonify({"ok": True, "provider": ("gemini" if GEMINI_KEY else "none"), "model": MODEL_NAME})
 
-@app.post("/chat")
+@app.route("/chat", methods=["POST", "OPTIONS"])
 def chat():
+    if request.method == "OPTIONS":
+        return ("", 204)
     data = request.get_json(silent=True) or {}
-    text = data.get("text", "")
-    reply = ai_reply(text)
-    return jsonify({"ok": True, "reply": reply})
+    msg = str(data.get("message","")).strip()
+    if not msg:
+        return jsonify({"error":"missing message"}), 400
+    return jsonify({"answer": answer(msg)})
 
-# ----------------- Socket.IO (2 chiều) -----------------
-# LƯU Ý: dùng event khác tên để tránh echo loop (user_message -> bot_message)
 @socketio.on("connect")
 def on_connect():
-    emit("status", {"ok": True, "message": "connected"}, broadcast=False)
+    emit("bot", {"message": "Kết nối WS ok!"})
 
-@socketio.on("user_message")
-def on_user_message(payload):
+@socketio.on("chat")
+def on_chat(data):
     try:
-        text = (payload or {}).get("text", "")
-        reply = ai_reply(text)
-        # Chỉ emit 'bot_message' về client đã gửi, không broadcast
-        emit("bot_message", {"text": reply}, broadcast=False)
-    except Exception as e:
-        emit("bot_message", {"text": f"Lỗi server: {e}"}, broadcast=False)
+        msg = str(data.get("message",""))
+    except Exception:
+        msg = str(data)
+    reply = answer(msg)
+    emit("bot", {"message": reply})
 
-# ----------------- Entry -----------------
 if __name__ == "__main__":
-    # Chạy dev local (Render sẽ dùng gunicorn theo Procfile)
-    socketio.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    port = int(os.environ.get("PORT", 8000))
+    socketio.run(app, host="0.0.0.0", port=port)
