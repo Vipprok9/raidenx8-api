@@ -3,11 +3,17 @@ services:
     name: raidenx8-api
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn server:app
+    startCommand: gunicorn --worker-class eventlet -w 1 -b 0.0.0.0:$PORT server:app
     envVars:
-      - key: GEMINI_API_KEY
-        sync: false
+      - key: PROVIDER
+        value: gemini
       - key: GEMINI_MODEL
-        value: models/gemini-2.5-pro-preview-03-25
+        value: models/gemini-2.5-flash-preview-05-20
       - key: FRONTEND_ORIGIN
         value: https://raidenx8.pages.dev
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
