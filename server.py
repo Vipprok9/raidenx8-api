@@ -1,98 +1,109 @@
-import os, json, requests
+import os, json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
+import httpx
 
-# ====== Config ======
-PROVIDER       = os.getenv("PROVIDER", "gemini")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash-preview-05-20")
-FRONTEND_ORI   = os.getenv("FRONTEND_ORIGIN", "*")
+# -------- Env --------
+PROVIDER        = os.getenv("PROVIDER", "gemini").lower()
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash-preview-05-20")
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
 
+# -------- App / CORS / Socket --------
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": FRONTEND_ORI}})
-socketio = SocketIO(app, cors_allowed_origins=FRONTEND_ORI, async_mode="eventlet")
+CORS(app, resources={r"/*": {"origins": FRONTEND_ORIGIN}})
+socketio = SocketIO(app, cors_allowed_origins=FRONTEND_ORIGIN, async_mode="eventlet")
 
 SYSTEM_PROMPT = (
-    "Bạn là RaidenX8 – trả lời ngắn gọn, rõ ràng, tiếng Việt tự nhiên."
+    "Bạn là RaidenX8 – trả lời ngắn gọn, tự nhiên, tiếng Việt. "
+    "Nếu không có dữ liệu thời gian thực, hãy nói rõ hạn chế và gợi ý câu tiếp theo."
 )
 
-# ====== Helpers (no recursion) ======
+# -------- Gemini (httpx) --------
 def call_gemini(text: str) -> str:
-    """
-    Gọi Gemini 1 lần (non-stream). Trả về string.
-    """
     if not GEMINI_API_KEY:
         return "Thiếu GEMINI_API_KEY trên server."
+
     url = f"https://generativelanguage.googleapis.com/v1beta/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [
             {"role": "user", "parts": [{"text": f"{SYSTEM_PROMPT}\n\nNgười dùng: {text}"}]}
         ]
     }
+
     try:
-        r = requests.post(url, json=payload, timeout=30)
-        j = r.json()
-        if r.status_code >= 400:
-            return f"Lỗi Gemini: {j.get('error', {}).get('message', r.text)}"
-        parts = j.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-        reply = "".join(p.get("text", "") for p in parts) or "(không có nội dung)"
-        return reply
+        limits  = httpx.Limits(max_keepalive_connections=2, max_connections=4)
+        timeout = httpx.Timeout(15.0, read=30.0)
+        with httpx.Client(limits=limits, timeout=timeout) as client:
+            r = client.post(url, json=payload)
+            if r.status_code >= 400:
+                try:
+                    j = r.json()
+                    msg = j.get("error", {}).get("message", r.text)
+                except Exception:
+                    msg = r.text
+                return f"Lỗi Gemini: {msg}"
+
+            j = r.json()
+            parts = j.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+            reply = "".join(p.get("text", "") for p in parts) or "(không có nội dung)"
+            return reply
+
+    except httpx.ReadTimeout:
+        return "Gemini đang chậm, thử lại nhé."
     except Exception as e:
-        return f"Lỗi gọi Gemini: {e}"
+        return f"Lỗi gọi Gemini: {type(e).__name__}"
 
-def handle_message(text: str) -> str:
-    """
-    Tách riêng logic xử lý; KHÔNG emit và KHÔNG tự gọi lại chính nó.
-    """
-    text = (text or "").strip()
-    if not text:
-        return "Bạn gửi nội dung trống rồi."
-    if PROVIDER == "gemini":
-        return call_gemini(text)
-    return "Provider không được hỗ trợ."
-
-# ====== HTTP APIs ======
+# -------- HTTP --------
 @app.get("/health")
 def health():
-    return {"ok": True, "provider": PROVIDER, "model": GEMINI_MODEL}
+    return jsonify({
+        "ok": True,
+        "provider": PROVIDER,
+        "model": GEMINI_MODEL
+    })
 
 @app.post("/ai/chat")
 def http_chat():
-    data = request.get_json(force=True, silent=True) or {}
-    txt  = data.get("text", "")
-    reply = handle_message(txt)
+    data = request.get_json(silent=True) or {}
+    msg  = (data.get("message") or "").strip()
+    if not msg:
+        return jsonify({"error": "Empty message"}), 400
+    reply = call_gemini(msg)
     return jsonify({"reply": reply})
 
-# ====== Socket.IO (2 chiều) ======
+# -------- WebSocket 2 chiều --------
 @socketio.on("connect")
 def on_connect():
-    emit("status", {"connected": True})
+    emit("server_status", {"connected": True})
 
 @socketio.on("disconnect")
 def on_disconnect():
-    # có thể log nếu muốn
+    # client sẽ tự tắt đèn trạng thái
     pass
 
 @socketio.on("typing")
 def on_typing(data):
-    # FWD typing state cho UI (nếu cần broadcast thì thêm broadcast=True)
-    emit("typing", {"typing": True})
-
-@socketio.on("stop_typing")
-def on_stop_typing():
-    emit("typing", {"typing": False})
+    # Echo trạng thái gõ phím về cho client hiển thị "typing..."
+    emit("typing", {"typing": bool(data.get("typing"))}, broadcast=False)
 
 @socketio.on("chat")
 def on_chat(data):
     """
-    Nhận tin nhắn từ client: { text: "..." }
-    Trả về một event 'reply' duy nhất -> KHÔNG đệ quy.
+    Nhận tin nhắn từ web: { msg: "..." }
+    → Gọi Gemini → emit('bot_reply', { text })
     """
-    txt = (data or {}).get("text", "")
-    reply = handle_message(txt)
-    emit("reply", {"text": reply})  # gửi lại cho chính người gửi
+    msg = (data or {}).get("msg", "")
+    if not msg.strip():
+        emit("bot_reply", {"text": "Bạn gửi nội dung trống rồi nè."})
+        return
+    # Cho UI biết đang xử lý
+    emit("thinking", {"on": True})
+    reply = call_gemini(msg)
+    emit("thinking", {"on": False})
+    emit("bot_reply", {"text": reply})
 
-if __name__ == "__main__":
-    # Dùng cho local test; trên Render dùng gunicorn (Procfile)
-    socketio.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+# Không dùng app.run khi chạy gunicorn
+# if __name__ == "__main__":
+#     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
