@@ -10,10 +10,6 @@ services:
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_MODEL
-        value: models/gemini-2.0-flash
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: OPENAI_MODEL
-        value: gpt-4o-mini
+        value: models/gemini-2.5-flash-preview-05-20
       - key: FRONTEND_ORIGIN
         value: https://raidenx8.pages.dev
