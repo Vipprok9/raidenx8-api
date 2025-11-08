@@ -164,7 +164,7 @@ def http_chat():
     return {"reply": reply}
 
 # (Alias tương thích frontend cũ nếu lỡ gọi /ai/chat_sync)
-@app.options("/ai/chat_sync")
+@app.route("/ai/chat_sync", methods=["OPTIONS"])
 def chat_sync_options():
     return ("", 204)
 
