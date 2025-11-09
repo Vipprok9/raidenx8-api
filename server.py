@@ -1,76 +1,80 @@
-# --- MUST BE FIRST ---
+# ---- MUST BE FIRST ----
 import eventlet
 eventlet.monkey_patch()
+# -----------------------
 
-import os, time
+import os, time, requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from flask_socketio import SocketIO
+from flask_socketio import SocketIO, emit
 import google.generativeai as genai
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 app = Flask(__name__)
 CORS(app)
-# async_mode='eventlet' để chắc chắn dùng eventlet
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet", ping_interval=25, ping_timeout=60)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet", ping_interval=25, ping_timeout=20)
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
+def call_gemini_sdk(model, msg):
+    m = genai.GenerativeModel(model)
+    res = m.generate_content(msg)
+    return getattr(res, "text", "").strip() or "(empty)"
+
+def call_gemini_25_rest(model, msg):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+    payload = {"contents": [{"parts": [{"text": msg}]}]}
+    r = requests.post(url, json=payload, timeout=40)
+    r.raise_for_status()
+    data = r.json()
+    return data["candidates"][0]["content"]["parts"][0].get("text","").strip()
+
+def smart_call(model, msg):
+    mdl = (model or DEFAULT_MODEL).strip()
+    if mdl.lower().startswith("gemini-2.5-flash-preview-0520"):
+        return call_gemini_25_rest(mdl, msg)
+    return call_gemini_sdk(mdl, msg)
+
 @app.get("/health")
 def health():
-    return jsonify({
-        "ok": True,
-        "gemini": bool(GEMINI_API_KEY),
-        "model": GEMINI_MODEL
-    })
+    return jsonify({"ok": True, "model_default": DEFAULT_MODEL})
 
 @app.post("/ai/chat")
 def ai_chat():
-    data = request.get_json(force=True) or {}
-    msg = data.get("message", "").strip()
-    mdl = data.get("model") or GEMINI_MODEL
-    if not msg:
-        return jsonify({"reply": "(demo) Nội dung trống."})
     if not GEMINI_API_KEY:
-        return jsonify({"reply": "(demo) Thiếu GEMINI_API_KEY nên trả lời demo."})
-
+        return jsonify({"reply": "(demo) Thiếu GEMINI_API_KEY."})
+    data = request.get_json(force=True, silent=True) or {}
+    msg = (data.get("message") or "").strip()
+    mdl = (data.get("model") or DEFAULT_MODEL).strip()
+    if not msg:
+        return jsonify({"reply": ""})
     try:
-        model = genai.GenerativeModel(mdl)
-        res = model.generate_content(msg)
-        text = getattr(res, "text", "") or "(empty)"
-        return jsonify({"reply": text})
+        text = smart_call(mdl, msg)
     except Exception as e:
-        return jsonify({"reply": f"Lỗi: {e}"})
+        text = f"Lỗi: {e}"
+    return jsonify({"reply": text, "model_used": mdl})
 
-# --- WebSocket 2 chiều ---
 @socketio.on("connect")
 def on_connect():
-    socketio.emit("bot_message", "(WS) Connected 🎧")
+    emit("bot_message", "WS connected ✓")
 
 @socketio.on("chat")
 def on_chat(data):
-    msg = (data or {}).get("message", "").strip()
-    mdl = (data or {}).get("model") or GEMINI_MODEL
-    socketio.emit("bot_typing")
-    time.sleep(0.2)
-
-    if not msg:
-        socketio.emit("bot_message", "(demo) Bạn chưa nhập nội dung.")
-        return
+    msg = (data or {}).get("message","").strip()
+    mdl = (data or {}).get("model") or DEFAULT_MODEL
+    emit("bot_typing")
+    time.sleep(0.15)
     if not GEMINI_API_KEY:
-        socketio.emit("bot_message", "(demo) WS ok nhưng thiếu GEMINI_API_KEY.")
+        emit("bot_message", "(demo) Thiếu GEMINI_API_KEY.")
         return
-
     try:
-        model = genai.GenerativeModel(mdl)
-        res = model.generate_content(msg)
-        text = getattr(res, "text", "") or "(empty)"
+        text = smart_call(mdl, msg)
     except Exception as e:
         text = f"Lỗi: {e}"
-    socketio.emit("bot_message", text)
+    emit("bot_message", text)
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
