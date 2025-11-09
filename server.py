@@ -1,97 +1,127 @@
-import os, json, random, time
+import os, time
+from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 import requests
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
+# ====== App & Socket ======
 app = Flask(__name__)
-CORS(app, resources={r"/*":{"origins":"*"}})
+CORS(app, resources={r"/*": {"origins": "*"}})
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
+OPENAI_KEY  = os.getenv("OPENAI_API_KEY", "")
+GEMINI_KEY  = os.getenv("GEMINI_API_KEY", "")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gemini-1.5-flash")
+
+# ====== Helpers ======
+def reply_demo(user_text: str) -> str:
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    tips = [
+        "Mình đang ở chế độ DEMO (không có API key).",
+        "Bạn có thể thêm GEMINI_API_KEY hoặc OPENAI_API_KEY vào Render → Environment.",
+        "Sau khi thêm key, redeploy là dùng được trả lời AI thật."
+    ]
+    return f"[DEMO] {now}. Bạn hỏi: “{user_text}”. " + " ".join(tips)
+
+def call_openai(model: str, text: str) -> str:
+    """Minimal OpenAI Chat Completions (gpt-4o-mini / gpt-4o)"""
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_KEY}"}
+    payload = {
+        "model": model or "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": "Bạn là trợ lý nói tiếng Việt, trả lời ngắn gọn, rõ ràng."},
+            {"role": "user", "content": text}
+        ]
+    }
+    r = requests.post(url, json=payload, headers=headers, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    return data["choices"][0]["message"]["content"]
+
+def call_gemini(model: str, text: str) -> str:
+    """Google Gemini generateContent v1beta (HTTP)"""
+    use_model = model or DEFAULT_MODEL or "gemini-1.5-flash"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{use_model}:generateContent?key={GEMINI_KEY}"
+    payload = {"contents": [{"parts": [{"text": text}]}]}
+    r = requests.post(url, json=payload, timeout=60)
+    # Gemini trả 200 cả khi lỗi model không tồn tại -> kiểm tra cẩn thận
+    if r.status_code != 200:
+        raise RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:500]}")
+    data = r.json()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        # trả thông báo dễ hiểu nếu model sai tên
+        msg = data.get("error", {}).get("message") or str(data)[:400]
+        raise RuntimeError(f"Gemini response error: {msg}")
+
+def smart_answer(model: str, text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return "Bạn hãy nhập nội dung cần hỏi nhé."
+    # Một vài rule nhanh (ví dụ thời tiết demo, giờ)
+    low = text.lower()
+    if "mấy giờ" in low or "thời gian" in low:
+        return time.strftime("Bây giờ là %H:%M:%S (giờ máy chủ).")
+    # Ưu tiên Gemini nếu có key và model bắt đầu bằng "gemini"
+    if GEMINI_KEY and (model.startswith("gemini") or not OPENAI_KEY):
+        return call_gemini(model, text)
+    if OPENAI_KEY:
+        return call_openai(model or "gpt-4o-mini", text)
+    # fallback demo
+    return reply_demo(text)
+
+# ====== REST endpoints ======
 @app.get("/health")
 def health():
-    return {"ok": True, "time": time.time()}
+    return jsonify({"ok": True, "ts": int(time.time())})
 
-@app.get("/prices")
-def prices():
-    # simple static sample to avoid external calls on free tiers
-    data = [
-        {"symbol":"BTC","price":"$69,850"},
-        {"symbol":"ETH","price":"$3,230"},
-        {"symbol":"BNB","price":"$580"},
-        {"symbol":"SOL","price":"$165"},
-        {"symbol":"TON","price":"$6.1"},
-        {"symbol":"USDT","price":"$1.00"},
-    ]
-    return jsonify({"prices": data})
+@app.post("/ai/chat")
+def ai_chat():
+    data = request.get_json(silent=True) or {}
+    model = (data.get("model") or DEFAULT_MODEL or "").strip()
+    text  = data.get("text", "")
+    try:
+        out = smart_answer(model, text)
+        return jsonify({"ok": True, "model": model, "answer": out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:800]}), 400
 
-def local_rules(text:str)->str:
-    t=text.lower().strip()
-    if "thời tiết" in t and "huế" in t:
-        return "Huế hôm nay: mưa rào nhẹ, nhiệt độ 25‑29°C, ẩm 82% (tham khảo)."
-    if "giá btc" in t or "bitcoin" in t:
-        return "BTC đang dao động quanh $69‑70k (mang tính tham khảo)."
-    return ""
-
-@app.post("/api/chat")
-def api_chat():
-    data = request.get_json(force=True) or {}
-    text = data.get("text","")
-    model = data.get("model","")
-    # Rule first
-    rule = local_rules(text)
-    if rule:
-        return jsonify({"reply": rule})
-
-    # Try OpenAI first
-    if OPENAI_API_KEY:
-        try:
-            import openai  # pip: openai>=1.40
-            from openai import OpenAI
-            client = OpenAI(api_key=OPENAI_API_KEY)
-            rsp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role":"system","content":"Bạn là trợ lý ngắn gọn, mượt, không chèn dấu sao vào câu đọc."},
-                          {"role":"user","content":text}],
-                temperature=0.6,
-            )
-            out = rsp.choices[0].message.content
-            return jsonify({"reply": out})
-        except Exception as e:
-            print("OpenAI error:", e)
-
-    # Try Gemini if available
-    if GEMINI_API_KEY:
-        try:
-            url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
-            payload = {"contents":[{"parts":[{"text":text}]}]}
-            r = requests.post(url, params={"key": GEMINI_API_KEY}, json=payload, timeout=20)
-            j = r.json()
-            out = j.get("candidates",[{}])[0].get("content",{}).get("parts",[{}])[0].get("text","")
-            if out:
-                return jsonify({"reply": out})
-        except Exception as e:
-            print("Gemini error:", e)
-
-    # Fallback
-    return jsonify({"reply": "Mình đã nhận: " + text})
-
-# ---- WebSocket (Socket.IO) ----
+# ====== Socket.IO (2 chiều, typing) ======
 @socketio.on("connect")
 def on_connect():
-    emit("ai_reply", {"text":"Đã kết nối WS realtime."})
+    emit("status", {"type": "info", "text": "WS connected 🎧"}, broadcast=False)
 
-@socketio.on("user_msg")
-def on_user_msg(payload):
-    text = (payload or {}).get("text","")
-    # Reuse /api/chat logic quickly
-    with app.test_request_context(json={"text":text}):
-        resp = api_chat().get_json()
-    emit("ai_reply", {"text": resp.get("reply","")})
+@socketio.on("disconnect")
+def on_disconnect():
+    # nothing to broadcast to others on personal app
+    pass
 
+@socketio.on("typing")
+def on_typing(data):
+    # client gửi {typing: true/false}
+    emit("typing", {"typing": bool(data.get("typing"))}, broadcast=True, include_self=False)
+
+@socketio.on("message")
+def on_message(data):
+    """Client gửi {text, model}; server phát lại tin user, gọi AI rồi phát tin AI"""
+    text  = (data or {}).get("text", "")
+    model = (data or {}).get("model", DEFAULT_MODEL)
+    # phát bong bóng người dùng (echo)
+    emit("message", {"role": "user", "text": text}, broadcast=True)
+    # báo đang gõ
+    emit("typing", {"typing": True}, broadcast=True)
+    try:
+        answer = smart_answer(model, text)
+    except Exception as e:
+        answer = f"Lỗi: {e}"
+    # dừng “typing” và phát trả lời
+    emit("typing", {"typing": False}, broadcast=True)
+    emit("message", {"role": "assistant", "text": answer}, broadcast=True)
+
+# ====== Entry point (Render sẽ chạy qua Procfile) ======
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    socketio.run(app, host="0.0.0.0", port=port)
+    # Dành cho chạy local: python server.py
+    socketio.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
