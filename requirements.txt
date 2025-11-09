@@ -1,3 +1,6 @@
 flask
 flask-cors
-gunicorn
+flask-socketio
+eventlet
+requests
+openai>=1.40.0

@@ -1,12 +1,12 @@
 services:
-  - type: web
-    name: raidenx8-api
-    env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --workers 1 --bind 0.0.0.0:$PORT server:app
-    envVars:
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: GEMINI_API_KEY
-        sync: false
+- type: web
+  name: rx8-backend
+  env: python
+  plan: free
+  buildCommand: pip install -r requirements.txt
+  startCommand: python server.py
+  envVars:
+  - key: OPENAI_API_KEY
+    sync: false
+  - key: GEMINI_API_KEY
+    sync: false
