@@ -1,8 +1,6 @@
 flask==3.0.3
 flask-cors==4.0.0
 flask-socketio==5.3.6
-eventlet==0.35.2
-gunicorn==22.0.0
-python-dotenv==1.0.1
+eventlet==0.36.1
 requests==2.32.3
-openai==1.51.2        # nếu dùng AI, không thì bỏ
+gunicorn==22.0.0
