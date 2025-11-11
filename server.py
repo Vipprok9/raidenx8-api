@@ -1,145 +1,136 @@
-# server.py — RaidenX8 API (v36.2) — Flask + Socket.IO + SSE
+# server.py — RaidenX8 API (v36.3)
 import os, json, time, datetime as dt
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# Optional AI providers
 USE_GEMINI = bool(os.getenv("GEMINI_API_KEY"))
 USE_OPENAI = bool(os.getenv("OPENAI_API_KEY"))
 
 app = Flask(__name__)
 CORS(app)
 
-# --- Socket.IO (eventlet friendly) ---
+# ---- Socket.IO (eventlet) ----
 try:
     from flask_socketio import SocketIO, emit
-    socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+    socketio = SocketIO(app, cors_allowed_origins="*")
 except Exception:
-    # SocketIO optional; app vẫn chạy được nếu Render chưa cài eventlet
     socketio = None
     emit = None
 
-# ----------------- Helpers -----------------
+# ---------- Helpers ----------
 def now_ts() -> int:
     return int(time.time())
 
 def nice_time_vn():
-    tz_offset = int(os.getenv("TZ_OFFSET", "7"))  # VN default +7
-    return (dt.datetime.utcnow() + dt.timedelta(hours=tz_offset)).strftime("%H:%M, %d/%m/%Y")
+    tz_offset = int(os.getenv("TZ_OFFSET", "7"))
+    return (dt.datetime.utcnow() + dt.timedelta(hours=tz_offset)).strftime("%H:%M %d/%m/%Y")
 
 def rule_based_reply(text: str) -> str:
-    """Fallback trả lời mượt khi không có API key."""
     t = text.lower().strip()
-    if not t:
-        return "Bạn hãy nhập nội dung cần hỏi nhé."
-    if "mấy giờ" in t or "thời gian" in t:
-        return f"Bây giờ là {nice_time_vn()} (giờ VN)."
-    if "thời tiết" in t:
-        return "Mình không có API thời tiết ở đây. Bạn có thể hỏi thành phố cụ thể, mình gợi ý cách tra nhanh."
     if "giá btc" in t or "bitcoin" in t:
-        return "Bản API free này chưa bật dữ liệu giá. Khi có CoinGecko/Exchange API mình sẽ báo giá realtime kèm % thay đổi."
-    if "hello" in t or "xin chào" in t:
-        return "Chào bạn! Mình là RX8 Bot. Bạn có thể hỏi về AI/Web3, banner Trinity, hoặc cấu hình deploy Render/CF Pages."
-    # default tone “Gemini-like”: rõ ràng, súc tích, nêu bước làm
+        return "Bản demo chưa mở API giá trực tiếp. Bạn dùng nút Ticker ở trên để xem nhanh nhé."
+    if "thời tiết" in t or "huế" in t:
+        return "Mình chưa bật API thời tiết. Khi có key mình sẽ trả lời theo địa phương."
+    if t in {"hi","hello","xin chào","chào"}:
+        return "Chào bạn! Mình là RX8 bot. Bạn có thể hỏi giá BTC, Solana, hoặc bất kỳ điều gì."
     return (
-        "Mình hiểu câu hỏi của bạn. Với bản demo này mình trả lời ngắn gọn, dễ làm theo. "
-        "Nếu bạn bật khóa **Gemini** hay **OpenAI** trong môi trường, mình sẽ trả lời chi tiết hơn."
+        "Mình đã nhận câu hỏi và đang chạy bản demo. "
+        "Nếu bạn bật khóa **Gemini** hoặc **OpenAI** ở backend Render, mình sẽ trả lời thông minh hơn."
     )
 
-# --------------- AI backends ----------------
-def ai_with_gemini(prompt: str, model: str | None):
+# ---------- AI backends ----------
+def ai_with_gemini(prompt: str, model: str|None) -> str:
     import google.generativeai as genai
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    mdl = model or os.getenv("GEMINI_MODEL", "gemini-1.5-flash-8b")
+    # Map tên 'gemini-studio-2.5-preview-05-20' → model hợp lệ bên Gemini (đổi nếu bạn dùng tên khác trong Studio)
+    mdl = model or os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
+    if mdl.startswith("gemini-studio-2.5") or "05-20" in (model or ""):
+        # nếu bạn publish từ Gemini Studio thành "models/xxx", đặt ENV GEMINI_MODEL=models/xxx và bỏ map này
+        mdl = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
     resp = genai.GenerativeModel(mdl).generate_content(prompt)
-    return resp.text.strip() if hasattr(resp, "text") and resp.text else "Mình chưa nhận được nội dung từ Gemini."
+    return (getattr(resp, "text", "") or "").strip() or rule_based_reply(prompt)
 
-def ai_with_openai(prompt: str, model: str | None):
+def ai_with_openai(prompt: str, model: str|None) -> str:
     from openai import OpenAI
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     mdl = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     chat = client.chat.completions.create(
         model=mdl,
-        messages=[{"role":"system","content":"Bạn là trợ lý ngắn gọn, mạch lạc."},
-                  {"role":"user","content":prompt}],
+        messages=[
+            {"role":"system","content":"Bạn là RX8 bot, trả lời ngắn gọn, tự nhiên, tiếng Việt."},
+            {"role":"user","content":prompt},
+        ],
         temperature=0.6,
     )
     return chat.choices[0].message.content.strip()
 
-def smart_answer(prompt: str, model: str | None):
-    # ưu tiên Gemini → OpenAI → rule-based
+def smart_answer(prompt: str, model: str|None) -> str:
     try:
+        # Ưu tiên Gemini nếu có key
         if USE_GEMINI:
             return ai_with_gemini(prompt, model)
         if USE_OPENAI:
             return ai_with_openai(prompt, model)
         return rule_based_reply(prompt)
     except Exception as e:
-        # nếu provider lỗi thì rơi về rule-based
-        return f"(AI lỗi tạm thời: {e})\n" + rule_based_reply(prompt)
+        return f"⚠️ Lỗi AI: {e}\n" + rule_based_reply(prompt)
 
-# ----------------- Routes -------------------
+# ---------- REST ----------
 @app.get("/health")
 def health():
-    return jsonify(ok=True, ts=now_ts())
+    return "ok", 200
 
 @app.get("/")
 def root():
-    return jsonify(ok=True, name="RaidenX8 API", ts=now_ts())
+    return jsonify({"ok": True, "ts": now_ts(), "service": "rx8-api"})
 
-# SSE: đẩy keep-alive + gói hello mượt
-@app.get("/stream")
-def stream():
-    def event_stream():
-        # chào 1 gói lúc mở kết nối
-        hello = {"type": "hello", "ts": now_ts()}
-        yield f"data: {json.dumps(hello)}\n\n"
-        # ping đều mỗi 10s để giữ kết nối
-        while True:
-            ping = {"type": "ping", "ts": now_ts()}
-            yield f"data: {json.dumps(ping)}\n\n"
-            time.sleep(10)
-    headers = {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
+@app.get("/prices")
+def prices():
+    # symbols=BTC,ETH,SOL...
+    import requests
+    symbols = request.args.get("symbols","BTC,ETH,SOL,TON,BNB,USDT").upper().split(",")
+    # Map đơn giản -> CoinGecko ids
+    id_map = {
+        "BTC":"bitcoin", "ETH":"ethereum", "SOL":"solana",
+        "TON":"the-open-network", "BNB":"binancecoin", "USDT":"tether"
     }
-    return Response(event_stream(), headers=headers)
+    ids = ",".join([id_map.get(s, s) for s in symbols])
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": ids, "vs_currencies": "usd", "include_24hr_change":"true"},
+            timeout=10,
+        )
+        raw = r.json()
+        data=[]
+        for s in symbols:
+            coin = id_map.get(s, s)
+            if coin in raw:
+                data.append({
+                    "symbol": s,
+                    "price": raw[coin]["usd"],
+                    "change24h": raw[coin].get("usd_24h_change", 0.0),
+                })
+        return jsonify({"data": data, "ts": now_ts()})
+    except Exception as e:
+        return jsonify({"error": str(e), "data": [], "ts": now_ts()}), 500
 
-# REST chat
-@app.post("/chat")
-def chat_rest():
-    data = request.get_json(force=True, silent=True) or {}
-    prompt = (data.get("message") or data.get("prompt") or "").strip()
-    model = data.get("model")
-    answer = smart_answer(prompt, model)
-    return jsonify(ok=True, model=(model or ("gemini" if USE_GEMINI else "openai" if USE_OPENAI else "rule")),
-                   answer=answer)
-
-# (Optional) minimal TTS stub – để frontend biết API sống
-@app.post("/api/tts")
-def tts_stub():
-    # Triển khai thật khi có GOOGLE/AZURE/OPENAI TTS; tạm trả text để frontend Web Speech đọc
-    data = request.get_json(force=True, silent=True) or {}
-    text = (data.get("text") or "").strip()
-    if not text:
-        return jsonify(ok=False, error="Thiếu text"), 400
-    return jsonify(ok=True, voice="vi-VN-demo", url=None, text=text)
-
-# ---------------- WebSocket chat ----------------
+# ---------- Socket.IO ----------
 if socketio:
-    @socketio.on("connect", namespace="/ws")
-    def ws_connect():
-        emit("info", {"ok": True, "msg": "WS connected", "ts": now_ts()})
+    @socketio.on("connect")
+    def on_connect():
+        emit("ai:reply", {"text": "WS connected • " + nice_time_vn()})
 
-    @socketio.on("chat", namespace="/ws")
-    def ws_chat(data):
-        text = (data or {}).get("message", "")
-        model = (data or {}).get("model")
-        answer = smart_answer(text, model)
-        emit("answer", {"ok": True, "answer": answer, "ts": now_ts()})
+    @socketio.on("ai:chat")
+    def on_ai_chat(payload):
+        text = (payload or {}).get("text", "")
+        model = (payload or {}).get("model")
+        reply = smart_answer(text, model)
+        emit("ai:reply", {"text": reply})
 
-# ------------- Gunicorn entry -------------------
-# Dùng: gunicorn --worker-class eventlet -w 1 -b 0.0.0.0:$PORT server:app
-# Nếu muốn WS: thay bằng server:socketio (nhưng Socket.IO vẫn wrap app)
+# ---------- WSGI ----------
+if __name__ == "__main__":
+    if socketio:
+        socketio.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    else:
+        app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
