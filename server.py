@@ -1,54 +1,49 @@
-# server.py — RaidenX8 API (v36.3)
-import os, json, time, datetime as dt
-from flask import Flask, request, jsonify
+# server.py — RaidenX8 API (v36.4 full)
+import os, time, datetime as dt
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-USE_GEMINI = bool(os.getenv("GEMINI_API_KEY"))
-USE_OPENAI = bool(os.getenv("OPENAI_API_KEY"))
-
+# ===== App & CORS =====
 app = Flask(__name__)
 CORS(app)
 
-# ---- Socket.IO (eventlet) ----
-try:
-    from flask_socketio import SocketIO, emit
-    socketio = SocketIO(app, cors_allowed_origins="*")
-except Exception:
-    socketio = None
-    emit = None
+# ===== Socket.IO (eventlet) =====
+from flask_socketio import SocketIO, emit
+socketio = SocketIO(app, cors_allowed_origins="*")
 
-# ---------- Helpers ----------
-def now_ts() -> int:
-    return int(time.time())
+# ===== Feature flags (có key thì xài AI) =====
+USE_GEMINI = bool(os.getenv("GEMINI_API_KEY"))
+USE_OPENAI = bool(os.getenv("OPENAI_API_KEY"))
 
+def now_ts() -> int: return int(time.time())
 def nice_time_vn():
-    tz_offset = int(os.getenv("TZ_OFFSET", "7"))
-    return (dt.datetime.utcnow() + dt.timedelta(hours=tz_offset)).strftime("%H:%M %d/%m/%Y")
+    tz = int(os.getenv("TZ_OFFSET", "7"))
+    return (dt.datetime.utcnow() + dt.timedelta(hours=tz)).strftime("%H:%M %d/%m/%Y")
 
+# ===== Rule-based fallback (khi không có key) =====
 def rule_based_reply(text: str) -> str:
-    t = text.lower().strip()
+    t = (text or "").lower().strip()
     if "giá btc" in t or "bitcoin" in t:
-        return "Bản demo chưa mở API giá trực tiếp. Bạn dùng nút Ticker ở trên để xem nhanh nhé."
-    if "thời tiết" in t or "huế" in t:
+        return "Demo chưa bật trả lời trực tiếp. Xem ticker phía trên nhé."
+    if "thời tiết" in t:
         return "Mình chưa bật API thời tiết. Khi có key mình sẽ trả lời theo địa phương."
     if t in {"hi","hello","xin chào","chào"}:
-        return "Chào bạn! Mình là RX8 bot. Bạn có thể hỏi giá BTC, Solana, hoặc bất kỳ điều gì."
-    return (
-        "Mình đã nhận câu hỏi và đang chạy bản demo. "
-        "Nếu bạn bật khóa **Gemini** hoặc **OpenAI** ở backend Render, mình sẽ trả lời thông minh hơn."
-    )
+        return "Chào bạn! Mình là RX8 bot. Bạn có thể hỏi giá, Solana, tin tức,…"
+    return ("Mình đã nhận câu hỏi. Khi bật **GEMINI_API_KEY** hoặc **OPENAI_API_KEY** "
+            "ở Render, mình sẽ trả lời thông minh hơn.")
 
-# ---------- AI backends ----------
+# ===== AI backends =====
 def ai_with_gemini(prompt: str, model: str|None) -> str:
     import google.generativeai as genai
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    # Map tên 'gemini-studio-2.5-preview-05-20' → model hợp lệ bên Gemini (đổi nếu bạn dùng tên khác trong Studio)
+    # Nếu bạn publish từ Gemini Studio → set ENV GEMINI_MODEL="models/xxx"
     mdl = model or os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
-    if mdl.startswith("gemini-studio-2.5") or "05-20" in (model or ""):
-        # nếu bạn publish từ Gemini Studio thành "models/xxx", đặt ENV GEMINI_MODEL=models/xxx và bỏ map này
+    # Cho phép chọn tên “gemini-studio-2.5-preview-05-20” từ frontend:
+    if (model or "").startswith("gemini-studio-2.5") or "05-20" in (model or ""):
         mdl = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
     resp = genai.GenerativeModel(mdl).generate_content(prompt)
-    return (getattr(resp, "text", "") or "").strip() or rule_based_reply(prompt)
+    txt = (getattr(resp, "text", "") or "").strip()
+    return txt or rule_based_reply(prompt)
 
 def ai_with_openai(prompt: str, model: str|None) -> str:
     from openai import OpenAI
@@ -58,7 +53,7 @@ def ai_with_openai(prompt: str, model: str|None) -> str:
         model=mdl,
         messages=[
             {"role":"system","content":"Bạn là RX8 bot, trả lời ngắn gọn, tự nhiên, tiếng Việt."},
-            {"role":"user","content":prompt},
+            {"role":"user","content": prompt},
         ],
         temperature=0.6,
     )
@@ -66,30 +61,27 @@ def ai_with_openai(prompt: str, model: str|None) -> str:
 
 def smart_answer(prompt: str, model: str|None) -> str:
     try:
-        # Ưu tiên Gemini nếu có key
-        if USE_GEMINI:
-            return ai_with_gemini(prompt, model)
-        if USE_OPENAI:
-            return ai_with_openai(prompt, model)
+        if USE_GEMINI: return ai_with_gemini(prompt, model)
+        if USE_OPENAI: return ai_with_openai(prompt, model)
         return rule_based_reply(prompt)
     except Exception as e:
         return f"⚠️ Lỗi AI: {e}\n" + rule_based_reply(prompt)
 
-# ---------- REST ----------
+# ===== REST =====
 @app.get("/health")
-def health():
-    return "ok", 200
+def health(): return "ok", 200
 
 @app.get("/")
-def root():
-    return jsonify({"ok": True, "ts": now_ts(), "service": "rx8-api"})
+def root(): return jsonify({"ok": True, "ts": now_ts(), "service": "rx8-api"})
 
 @app.get("/prices")
 def prices():
-    # symbols=BTC,ETH,SOL...
+    """
+    Trả giá hiện tại + %24h (CoinGecko).
+    Dùng ở frontend ticker: BTC, ETH, SOL, TON, BNB, USDT
+    """
     import requests
     symbols = request.args.get("symbols","BTC,ETH,SOL,TON,BNB,USDT").upper().split(",")
-    # Map đơn giản -> CoinGecko ids
     id_map = {
         "BTC":"bitcoin", "ETH":"ethereum", "SOL":"solana",
         "TON":"the-open-network", "BNB":"binancecoin", "USDT":"tether"
@@ -115,22 +107,26 @@ def prices():
     except Exception as e:
         return jsonify({"error": str(e), "data": [], "ts": now_ts()}), 500
 
-# ---------- Socket.IO ----------
-if socketio:
-    @socketio.on("connect")
-    def on_connect():
-        emit("ai:reply", {"text": "WS connected • " + nice_time_vn()})
+# ==== REST /ai/chat (tùy chọn) ====
+@app.post("/ai/chat")
+def ai_chat_http():
+    data = request.get_json(silent=True) or {}
+    text = data.get("text","")
+    model = data.get("model")
+    return jsonify({"text": smart_answer(text, model)})
 
-    @socketio.on("ai:chat")
-    def on_ai_chat(payload):
-        text = (payload or {}).get("text", "")
-        model = (payload or {}).get("model")
-        reply = smart_answer(text, model)
-        emit("ai:reply", {"text": reply})
+# ===== Socket.IO =====
+@socketio.on("connect")
+def on_connect():
+    emit("ai:reply", {"text": "WS connected • " + nice_time_vn()})
 
-# ---------- WSGI ----------
+@socketio.on("ai:chat")
+def on_ai_chat(payload):
+    text = (payload or {}).get("text", "")
+    model = (payload or {}).get("model")
+    reply = smart_answer(text, model)
+    emit("ai:reply", {"text": reply})
+
+# ===== WSGI =====
 if __name__ == "__main__":
-    if socketio:
-        socketio.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
-    else:
-        app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    socketio.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
