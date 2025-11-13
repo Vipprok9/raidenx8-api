@@ -3,5 +3,5 @@ services:
     name: rx8-backend-ws
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker server:app
+    startCommand: gunicorn -k eventlet -w 1 server:app
     plan: free

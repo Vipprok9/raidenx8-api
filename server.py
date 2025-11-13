@@ -1,5 +1,8 @@
 import os
 import json
+import eventlet
+eventlet.monkey_patch()
+
 from flask import Flask, jsonify
 from flask_cors import CORS
 from flask_sock import Sock
@@ -22,7 +25,7 @@ def health():
     return jsonify(
         {
             "status": "ok",
-            "service": "rx8-backend-ws-v1",
+            "service": "rx8-backend-ws-v1.1",
             "openai": bool(OPENAI_API_KEY),
         }
     )
@@ -45,6 +48,7 @@ def rx8_ws(ws):
         { "type": "done" }                        # tắt typing
     """
 
+
     while True:
         msg = ws.receive()
         if msg is None:
@@ -63,7 +67,7 @@ def rx8_ws(ws):
                 json.dumps(
                     {
                         "type": "chat",
-                        "text": "RX8 realtime backend đã kết nối ✅",
+                        "text": "RX8 realtime backend v1.1 (eventlet) đã kết nối ✅",
                     }
                 )
             )
