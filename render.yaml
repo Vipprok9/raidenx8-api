@@ -1,17 +1,7 @@
 services:
   - type: web
-    name: raidenx8-api
-    runtime: python
-    envVars:
-      - key: GEMINI_API_KEY
-        sync: false
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: GEMINI_MODEL
-        sync: false
-      - key: OPENAI_MODEL
-        sync: false
-      - key: TZ_OFFSET
-        value: "7"
+    name: rx8-backend-ws
+    env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --worker-class eventlet -w 1 -b 0.0.0.0:$PORT server:app
+    startCommand: gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker server:app
+    plan: free

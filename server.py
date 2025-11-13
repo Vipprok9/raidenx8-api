@@ -1,132 +1,143 @@
-# server.py — RaidenX8 API (v36.4 full)
-import os, time, datetime as dt
-from flask import Flask, jsonify, request
+import os
+import json
+from flask import Flask, jsonify
 from flask_cors import CORS
+from flask_sock import Sock
+from openai import OpenAI
 
-# ===== App & CORS =====
+# ===== CẤU HÌNH CƠ BẢN =====
 app = Flask(__name__)
 CORS(app)
+sock = Sock(app)
 
-# ===== Socket.IO (eventlet) =====
-from flask_socketio import SocketIO, emit
-socketio = SocketIO(app, cors_allowed_origins="*")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-# ===== Feature flags (có key thì xài AI) =====
-USE_GEMINI = bool(os.getenv("GEMINI_API_KEY"))
-USE_OPENAI = bool(os.getenv("OPENAI_API_KEY"))
+client = None
+if OPENAI_API_KEY:
+    client = OpenAI(api_key=OPENAI_API_KEY)
 
-def now_ts() -> int: return int(time.time())
-def nice_time_vn():
-    tz = int(os.getenv("TZ_OFFSET", "7"))
-    return (dt.datetime.utcnow() + dt.timedelta(hours=tz)).strftime("%H:%M %d/%m/%Y")
 
-# ===== Rule-based fallback (khi không có key) =====
-def rule_based_reply(text: str) -> str:
-    t = (text or "").lower().strip()
-    if "giá btc" in t or "bitcoin" in t:
-        return "Demo chưa bật trả lời trực tiếp. Xem ticker phía trên nhé."
-    if "thời tiết" in t:
-        return "Mình chưa bật API thời tiết. Khi có key mình sẽ trả lời theo địa phương."
-    if t in {"hi","hello","xin chào","chào"}:
-        return "Chào bạn! Mình là RX8 bot. Bạn có thể hỏi giá, Solana, tin tức,…"
-    return ("Mình đã nhận câu hỏi. Khi bật **GEMINI_API_KEY** hoặc **OPENAI_API_KEY** "
-            "ở Render, mình sẽ trả lời thông minh hơn.")
-
-# ===== AI backends =====
-def ai_with_gemini(prompt: str, model: str|None) -> str:
-    import google.generativeai as genai
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    # Nếu bạn publish từ Gemini Studio → set ENV GEMINI_MODEL="models/xxx"
-    mdl = model or os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
-    # Cho phép chọn tên “gemini-studio-2.5-preview-05-20” từ frontend:
-    if (model or "").startswith("gemini-studio-2.5") or "05-20" in (model or ""):
-        mdl = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
-    resp = genai.GenerativeModel(mdl).generate_content(prompt)
-    txt = (getattr(resp, "text", "") or "").strip()
-    return txt or rule_based_reply(prompt)
-
-def ai_with_openai(prompt: str, model: str|None) -> str:
-    from openai import OpenAI
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    mdl = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    chat = client.chat.completions.create(
-        model=mdl,
-        messages=[
-            {"role":"system","content":"Bạn là RX8 bot, trả lời ngắn gọn, tự nhiên, tiếng Việt."},
-            {"role":"user","content": prompt},
-        ],
-        temperature=0.6,
+@app.route("/health")
+def health():
+    return jsonify(
+        {
+            "status": "ok",
+            "service": "rx8-backend-ws-v1",
+            "openai": bool(OPENAI_API_KEY),
+        }
     )
-    return chat.choices[0].message.content.strip()
 
-def smart_answer(prompt: str, model: str|None) -> str:
-    try:
-        if USE_GEMINI: return ai_with_gemini(prompt, model)
-        if USE_OPENAI: return ai_with_openai(prompt, model)
-        return rule_based_reply(prompt)
-    except Exception as e:
-        return f"⚠️ Lỗi AI: {e}\n" + rule_based_reply(prompt)
 
-# ===== REST =====
-@app.get("/health")
-def health(): return "ok", 200
+# ===== WEBSOCKET CHO RX8 WOW-TV v12.5 =====
+@sock.route("/ws/rx8")
+def rx8_ws(ws):
+    """WebSocket endpoint cho frontend RX8 WOW-TV v12.5.
 
-@app.get("/")
-def root(): return jsonify({"ok": True, "ts": now_ts(), "service": "rx8-api"})
+    Giao thức:
+    - Client gửi:
+        { "type": "hello", "client": "rx8-wow-tv-v12.5" }
+        { "type": "chat",  "text": "..." }
 
-@app.get("/prices")
-def prices():
+    - Server gửi:
+        { "type": "chat",   "text": "..." }        # tin nhắn đơn
+        { "type": "typing" }                      # bật bong bóng typing
+        { "type": "chunk",  "text": "..." }       # stream token-by-token
+        { "type": "done" }                        # tắt typing
     """
-    Trả giá hiện tại + %24h (CoinGecko).
-    Dùng ở frontend ticker: BTC, ETH, SOL, TON, BNB, USDT
-    """
-    import requests
-    symbols = request.args.get("symbols","BTC,ETH,SOL,TON,BNB,USDT").upper().split(",")
-    id_map = {
-        "BTC":"bitcoin", "ETH":"ethereum", "SOL":"solana",
-        "TON":"the-open-network", "BNB":"binancecoin", "USDT":"tether"
-    }
-    ids = ",".join([id_map.get(s, s) for s in symbols])
-    try:
-        r = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": ids, "vs_currencies": "usd", "include_24hr_change":"true"},
-            timeout=10,
-        )
-        raw = r.json()
-        data=[]
-        for s in symbols:
-            coin = id_map.get(s, s)
-            if coin in raw:
-                data.append({
-                    "symbol": s,
-                    "price": raw[coin]["usd"],
-                    "change24h": raw[coin].get("usd_24h_change", 0.0),
-                })
-        return jsonify({"data": data, "ts": now_ts()})
-    except Exception as e:
-        return jsonify({"error": str(e), "data": [], "ts": now_ts()}), 500
 
-# ==== REST /ai/chat (tùy chọn) ====
-@app.post("/ai/chat")
-def ai_chat_http():
-    data = request.get_json(silent=True) or {}
-    text = data.get("text","")
-    model = data.get("model")
-    return jsonify({"text": smart_answer(text, model)})
+    while True:
+        msg = ws.receive()
+        if msg is None:
+            break
 
-# ===== Socket.IO =====
-@socketio.on("connect")
-def on_connect():
-    emit("ai:reply", {"text": "WS connected • " + nice_time_vn()})
+        try:
+            data = json.loads(msg)
+        except Exception:
+            # Nếu không phải JSON thì bỏ qua
+            continue
 
-@socketio.on("ai:chat")
-def on_ai_chat(payload):
-    text = (payload or {}).get("text", "")
-    model = (payload or {}).get("model")
-    reply = smart_answer(text, model)
-    emit("ai:reply", {"text": reply})
+        msg_type = data.get("type")
 
-# ===== WSGI =====
+        if msg_type == "hello":
+            ws.send(
+                json.dumps(
+                    {
+                        "type": "chat",
+                        "text": "RX8 realtime backend đã kết nối ✅",
+                    }
+                )
+            )
+            continue
+
+        if msg_type != "chat":
+            continue
+
+        user_text = (data.get("text") or "").strip()
+        if not user_text:
+            continue
+
+        # Nếu chưa cấu hình OPENAI_API_KEY -> trả lời demo ngắn
+        if not client:
+            ws.send(json.dumps({"type": "typing"}))
+            ws.send(
+                json.dumps(
+                    {
+                        "type": "chat",
+                        "text": "⚠️ Backend RX8 đã chạy nhưng chưa có OPENAI_API_KEY. "
+                        "Hãy set biến môi trường OPENAI_API_KEY trên Render để bật AI.",
+                    }
+                )
+            )
+            ws.send(json.dumps({"type": "done"}))
+            continue
+
+        # Bật trạng thái typing trên frontend
+        ws.send(json.dumps({"type": "typing"}))
+
+        try:
+            # Gọi OpenAI dạng stream
+            stream = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Bạn là RX8 – trợ lý AI phong cách Web3 + tu tiên, "
+                            "trả lời ngắn gọn, rõ ràng, dùng tiếng Việt, "
+                            "vừa chill vừa ngầu, phù hợp banner trình chiếu sự kiện."
+                        ),
+                    },
+                    {"role": "user", "content": user_text},
+                ],
+                stream=True,
+            )
+
+            for chunk in stream:
+                choice = chunk.choices[0]
+                delta = getattr(choice, "delta", None)
+                if not delta or not getattr(delta, "content", None):
+                    continue
+                text_piece = delta.content
+                ws.send(json.dumps({"type": "chunk", "text": text_piece}))
+
+            # Thông báo hoàn tất
+            ws.send(json.dumps({"type": "done"}))
+
+        except Exception as e:
+            # Nếu có lỗi, báo ngắn gọn và không làm rớt kết nối
+            ws.send(
+                json.dumps(
+                    {
+                        "type": "chat",
+                        "text": "⚠️ Lỗi backend RX8: {}"
+                        .format(str(e)[:200]),
+                    }
+                )
+            )
+            ws.send(json.dumps({"type": "done"}))
+
+
 if __name__ == "__main__":
-    socketio.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    # Chạy local để test, Render sẽ dùng gunicorn trong Procfile
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host="0.0.0.0", port=port, debug=True)
