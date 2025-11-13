@@ -1,6 +1,10 @@
 flask
 flask-cors
 flask-sock
-openai
 gunicorn
+
 eventlet>=0.33.0
+requests
+
+openai
+google-generativeai
